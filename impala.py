@@ -1,33 +1,30 @@
-"""PPO, heavily inspired by PufferLib and CleanRL."""
+"""IMPALA: https://arxiv.org/pdf/1802.01561."""
 from dataclasses import dataclass
 import torch
-import torch.nn.functional as F
 from torch import nn
 from torch.optim import Adam
 from torch.distributions import Categorical
 from torch.utils.tensorboard import SummaryWriter
 import gymnasium as gym
 import numpy as np
-from cli_params import CLIParams
 import envpool
+from cli_params import CLIParams
 
 torch.set_float32_matmul_precision("high")
 
 
 @dataclass
 class HyperParams(CLIParams):
-    n_epochs: int = 5000
+    n_epochs: int = 2500
     n_steps: int = 128
     n_envs: int = 16
     device: str = "cuda"
 
     lr: float = 3e-4
-    ppo_epochs: int = 4
-    minibatch_size: int = 256
+    update_steps: int = 4
 
     discount_gamma: float = 0.99
-    gae_lambda: float = 0.95
-    clip_eps: float = 0.2
+    importance_sampling_max_weight: float = 1.0
     critic_loss_coeff: float = 0.5
     entropy_coeff: float = 0.01
     max_grad_norm: float = 0.5
@@ -35,9 +32,6 @@ class HyperParams(CLIParams):
     n_frame_stack: int = 4
 
     output_dir: str = "runs/test"
-
-    def check_args(self):
-        assert (self.n_envs * self.n_steps) % self.minibatch_size == 0
 
 HP = HyperParams()
 
@@ -128,9 +122,7 @@ obss = torch.zeros((HP.n_steps+1, HP.n_envs) + OBS_SHAPE, dtype=torch.float32, d
 dones = torch.zeros((HP.n_steps+1, HP.n_envs), dtype=torch.float32, device=HP.device)
 actions = torch.zeros((HP.n_steps, HP.n_envs), dtype=torch.int64, device=HP.device)
 rewards = torch.zeros((HP.n_steps, HP.n_envs), dtype=torch.float32, device=HP.device)
-advantages = torch.zeros((HP.n_steps, HP.n_envs), dtype=torch.float32, device=HP.device)
 old_log_probs = torch.zeros((HP.n_steps, HP.n_envs), dtype=torch.float32, device=HP.device)
-values = torch.zeros((HP.n_steps+1, HP.n_envs), dtype=torch.float32, device=HP.device)
 
 obs, _ = envs.reset()
 obs = torch.tensor(obs, dtype=torch.float32, device=HP.device)
@@ -150,13 +142,12 @@ for epoch in range(HP.n_epochs):
         # plt.imshow(obs[0][0].cpu().numpy(), cmap="gray")
         # plt.show()
         with torch.no_grad():
-            logits, value = agent(obs)
+            logits = agent.get_action_logits(obs)
         action_dist = Categorical(logits=logits)
         action = action_dist.sample()
 
         actions[t] = action
         old_log_probs[t] = action_dist.log_prob(action)
-        values[t] = value
 
         obs, reward, terminated, truncated, info = envs.step(agent.ACTION_MAP[action.cpu()].numpy())
         rewards[t] = torch.tensor(reward, dtype=torch.float32, device=HP.device)
@@ -172,54 +163,44 @@ for epoch in range(HP.n_epochs):
             episode_length += info["stats"]["lens"][done_mask].sum()
             n_episodes += done_mask.sum()
 
-    # GAE.
-    with torch.no_grad():
-        values[-1] = agent.get_values(obs)
-        gae_accum = torch.zeros(HP.n_envs, dtype=torch.float32, device=HP.device)
-        for t in reversed(range(HP.n_steps)):
-            # If not done, bootstrap w/ next value.
-            next_nonterminal = 1 - dones[t+1]
-            delta = rewards[t] + HP.discount_gamma * values[t+1] * next_nonterminal - values[t]
-            advantages[t] = gae_accum = delta + HP.discount_gamma * HP.gae_lambda * gae_accum * next_nonterminal
-        value_targets = advantages + values[:-1]
-
-    # Batch buffers.
-    b_obss = obss[:-1].view(-1, *OBS_SHAPE)
-    b_actions, b_advantages, b_old_log_probs, b_value_targets = (
-        x.view(-1) for x in (actions, advantages, old_log_probs, value_targets)
-    )
-    total_samples = len(b_obss)
-
     # Linearly decay lr to 0.
     optim.param_groups[0]["lr"] = HP.lr - (HP.lr / HP.n_epochs) * epoch
 
-    # Optimize.
-    for _ in range(HP.ppo_epochs):
-        idxs = torch.randperm(total_samples, device=HP.device)
-        for i in range(0, total_samples, HP.minibatch_size):
-            batch_idxs = idxs[i : i+HP.minibatch_size]
-            logits, value = agent(b_obss[batch_idxs])
-            action_dist = Categorical(logits=logits)
-            log_probs = action_dist.log_prob(b_actions[batch_idxs])
-            entropy = action_dist.entropy().mean()
+    for _ in range(HP.update_steps):
+        # Compute current policy probs and values.
+        logits, values = agent(obss.view(-1, *OBS_SHAPE))
+        logits, values = [t.view(-1, HP.n_envs, *t.shape[1:]) for t in (logits, values)]
+        action_dist = Categorical(logits=logits[:-1])
+        log_probs = action_dist.log_prob(actions)
 
-            # TODO: log kl + clipfrac.
-            ratios = (log_probs - b_old_log_probs[batch_idxs]).exp()
-            adv_mb = b_advantages[batch_idxs]
-            normed_advs = (adv_mb - adv_mb.mean()) / (adv_mb.std() + 1e-8)
-            pg1 = ratios * normed_advs
-            pg2 = ratios.clip(1-HP.clip_eps, 1+HP.clip_eps) * normed_advs
-            policy_loss = -torch.minimum(pg1, pg2).mean()
+        entropy = action_dist.entropy().mean()
 
-            # TODO: value clipping.
-            critic_loss = 0.5 * F.mse_loss(value, b_value_targets[batch_idxs])
+        # V-trace.
+        with torch.no_grad():
+            ratios = (log_probs - old_log_probs).exp()
+            # NOTE: Assumes same importance sampling weight max for past and current actions.
+            truncated_ratios = ratios.clamp(max=HP.importance_sampling_max_weight)
 
-            loss = policy_loss + (HP.critic_loss_coeff * critic_loss) - (HP.entropy_coeff * entropy)
+        next_nonterminal = 1 - dones[1:]
+        td_delta = rewards + (next_nonterminal * HP.discount_gamma * values[1:].detach()) - values[:-1]
 
-            optim.zero_grad(set_to_none=True)
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=HP.max_grad_norm).item()
-            optim.step()
+        value_deltas = torch.zeros((HP.n_steps+1, HP.n_envs), dtype=torch.float32, device=HP.device)
+        for t in reversed(range(HP.n_steps)):
+            value_deltas[t] = truncated_ratios[t] * (next_nonterminal[t] * HP.discount_gamma * value_deltas[t+1] + td_delta[t])
+
+        critic_loss = 0.5 * value_deltas[:-1].square().mean()
+
+        # Policy update.
+        with torch.no_grad():
+            advantages = td_delta + (next_nonterminal * HP.discount_gamma * value_deltas[1:])
+        policy_loss = -(log_probs * advantages * truncated_ratios).mean()
+
+        # Optimize.
+        loss = policy_loss + (HP.critic_loss_coeff * critic_loss) - (HP.entropy_coeff * entropy)
+        optim.zero_grad(set_to_none=True)
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=HP.max_grad_norm).item()
+        optim.step()
 
     # Log.
     mean_total_reward = None
@@ -233,6 +214,7 @@ for epoch in range(HP.n_epochs):
     log.add_scalar("loss/entropy", entropy.item(), epoch)
     log.add_scalar("train/grad_norm", grad_norm, global_step=epoch)
     log.add_scalar("train/lr", optim.param_groups[0]["lr"], epoch)
+    log.add_scalar("train/ratio", ratios.mean().item(), epoch)
     print(f"{epoch}: reward={mean_total_reward}")
 
 log.close()
