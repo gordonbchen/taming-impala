@@ -24,7 +24,8 @@ class HyperParams(CLIParams):
     update_steps: int = 4
 
     discount_gamma: float = 0.99
-    impala_max_ratio: float = 1.0
+    impala_max_rho: float = 1.0
+    impala_max_c: float = 1.0
     critic_loss_coeff: float = 0.5
     entropy_coeff: float = 0.01
     max_grad_norm: float = 0.5
@@ -107,16 +108,17 @@ def calc_vtrace_targets(values: Tensor, rewards: Tensor, dones: Tensor, log_prob
     td_deltas = rewards + next_nonterminal * HP.discount_gamma * values[1:] - values[:-1]
 
     action_ratios = (log_probs - old_log_probs).exp()
-    truncated_ratios = action_ratios.clamp(max=HP.impala_max_ratio)
+    rho = action_ratios.clamp(max=HP.impala_max_rho)
+    c = action_ratios.clamp(max=HP.impala_max_c)
 
     vtrace_deltas = torch.zeros_like(values)
     for t in reversed(range(HP.n_steps)):
-        vtrace_deltas[t] = truncated_ratios[t] * (td_deltas[t] + next_nonterminal[t] * HP.discount_gamma * vtrace_deltas[t+1])
+        vtrace_deltas[t] = rho[t] * td_deltas[t] + next_nonterminal[t] * HP.discount_gamma * c[t] * vtrace_deltas[t+1]
     vtrace_targets = vtrace_deltas + values
 
     advantages = rewards + next_nonterminal * HP.discount_gamma * vtrace_targets[1:] - values[:-1]
 
-    return vtrace_targets, advantages, truncated_ratios, action_ratios
+    return vtrace_targets, advantages, rho, action_ratios
 
 
 # Create envs.
@@ -185,9 +187,9 @@ for epoch in range(HP.n_epochs):
         log_probs = action_dist.log_prob(actions)
         entropy = action_dist.entropy().mean()
 
-        vtrace_targets, advantages, truncated_ratios, action_ratios = calc_vtrace_targets(values, rewards, dones, log_probs, old_log_probs)
+        vtrace_targets, advantages, rho, action_ratios = calc_vtrace_targets(values, rewards, dones, log_probs, old_log_probs)
         critic_loss = 0.5 * (vtrace_targets[:-1] - values[:-1]).square().mean()
-        policy_loss = -(truncated_ratios * advantages * log_probs).mean()
+        policy_loss = -(rho * advantages * log_probs).mean()
 
         loss = policy_loss + (HP.critic_loss_coeff * critic_loss) - (HP.entropy_coeff * entropy)
         optim.zero_grad(set_to_none=True)
