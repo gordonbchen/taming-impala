@@ -1,21 +1,21 @@
 """IMPALA: https://arxiv.org/pdf/1802.01561."""
 from dataclasses import dataclass
-import torch
-from torch import nn
-from torch.optim import Adam
-from torch.distributions import Categorical
-from torch.utils.tensorboard import SummaryWriter
+import envpool
 import gymnasium as gym
 import numpy as np
-import envpool
+import torch
 from cli_params import CLIParams
+from torch import nn, Tensor
+from torch.distributions import Categorical
+from torch.optim import Adam
+from torch.utils.tensorboard import SummaryWriter
 
 torch.set_float32_matmul_precision("high")
 
 
 @dataclass
 class HyperParams(CLIParams):
-    n_epochs: int = 2500
+    n_epochs: int = 4000
     n_steps: int = 128
     n_envs: int = 16
     device: str = "cuda"
@@ -24,7 +24,7 @@ class HyperParams(CLIParams):
     update_steps: int = 4
 
     discount_gamma: float = 0.99
-    importance_sampling_max_weight: float = 1.0
+    impala_max_ratio: float = 1.0
     critic_loss_coeff: float = 0.5
     entropy_coeff: float = 0.01
     max_grad_norm: float = 0.5
@@ -41,7 +41,6 @@ def layer_init(layer, gain: float = 2**0.5, bias: float = 0.0):
     torch.nn.init.constant_(layer.bias, bias)
     return layer
 
-
 class Agent(nn.Module):
     def __init__(self):
         super().__init__()
@@ -54,22 +53,18 @@ class Agent(nn.Module):
             nn.ReLU(),
             nn.Flatten(),
             layer_init(nn.Linear(64 * 8 * 8, 64)),
-            nn.ReLU()
+            nn.ReLU(),
         )
         # 0 = NOOP, 1 = LEFT, 2 = RIGHT.
         self.ACTION_MAP = torch.tensor([0, 3, 2], dtype=torch.int64)
         self.policy = layer_init(nn.Linear(64, len(self.ACTION_MAP)), gain=0.01)
-        self.critic = layer_init(nn.Linear(64, 1), gain=1)
+        self.critic = layer_init(nn.Linear(64, 1), gain=1.0)
 
     def forward(self, obs):
         obs = obs / 255.0
         z = self.net(obs)
         return self.policy(z), self.critic(z).squeeze(-1)
-    
-    def get_values(self, obs):
-        obs = obs / 255.0
-        return self.critic(self.net(obs)).squeeze(-1)
-    
+
     def get_action_logits(self, obs):
         obs = obs / 255.0
         return self.policy(self.net(obs))
@@ -83,7 +78,7 @@ class EnvPoolEpisodeStats(gym.Wrapper):
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        self.episode_returns[:] = 0
+        self.episode_returns[:] = 0.0
         self.episode_lengths[:] = 0
         return obs, info
 
@@ -95,17 +90,34 @@ class EnvPoolEpisodeStats(gym.Wrapper):
         self.episode_lengths += 1
 
         if dones.any():
-            info["stats"] = {}
-            info["stats"]["done_mask"] = dones
-
-            # Only meaningful where dones == True
-            info["stats"]["returns"] = self.episode_returns.copy()
-            info["stats"]["lens"] = self.episode_lengths.copy()
-
+            info["stats"] = {
+                "done_mask": dones,
+                "returns": self.episode_returns.copy(),
+                "lens": self.episode_lengths.copy(),
+            }
             self.episode_returns[dones] = 0.0
             self.episode_lengths[dones] = 0
 
         return obs, rewards, terminated, truncated, info
+
+
+@torch.no_grad()
+def calc_vtrace_targets(values: Tensor, rewards: Tensor, dones: Tensor, log_probs: Tensor, old_log_probs: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    next_nonterminal = 1.0 - dones[1:]
+    td_deltas = rewards + next_nonterminal * HP.discount_gamma * values[1:] - values[:-1]
+
+    action_ratios = (log_probs - old_log_probs).exp()
+    truncated_ratios = action_ratios.clamp(max=HP.impala_max_ratio)
+
+    vtrace_deltas = torch.zeros_like(values)
+    for t in reversed(range(HP.n_steps)):
+        vtrace_deltas[t] = truncated_ratios[t] * (td_deltas[t] + next_nonterminal[t] * HP.discount_gamma * vtrace_deltas[t+1])
+    vtrace_targets = vtrace_deltas + values
+
+    advantages = rewards + next_nonterminal * HP.discount_gamma * vtrace_targets[1:] - values[:-1]
+
+    return vtrace_targets, advantages, truncated_ratios, action_ratios
+
 
 # Create envs.
 envs = envpool.make_gymnasium("Pong-v5", num_envs=HP.n_envs)
@@ -130,7 +142,7 @@ done = torch.zeros(HP.n_envs, dtype=torch.float32, device=HP.device)
 
 log = SummaryWriter(log_dir=HP.output_dir)
 for epoch in range(HP.n_epochs):
-    total_reward = 0
+    total_reward = 0.0
     episode_length = 0
     n_episodes = 0
 
@@ -157,45 +169,26 @@ for epoch in range(HP.n_epochs):
         obss[t+1] = obs
         dones[t+1] = done
 
-        if "stats" in info.keys():
+        if "stats" in info:
             done_mask = info["stats"]["done_mask"]
             total_reward += info["stats"]["returns"][done_mask].sum()
             episode_length += info["stats"]["lens"][done_mask].sum()
-            n_episodes += done_mask.sum()
+            n_episodes += int(done_mask.sum())
 
     # Linearly decay lr to 0.
     optim.param_groups[0]["lr"] = HP.lr - (HP.lr / HP.n_epochs) * epoch
 
     for _ in range(HP.update_steps):
-        # Compute current policy probs and values.
         logits, values = agent(obss.view(-1, *OBS_SHAPE))
         logits, values = [t.view(-1, HP.n_envs, *t.shape[1:]) for t in (logits, values)]
         action_dist = Categorical(logits=logits[:-1])
         log_probs = action_dist.log_prob(actions)
-
         entropy = action_dist.entropy().mean()
 
-        # V-trace.
-        with torch.no_grad():
-            ratios = (log_probs - old_log_probs).exp()
-            # NOTE: Assumes same importance sampling weight max for past and current actions.
-            truncated_ratios = ratios.clamp(max=HP.importance_sampling_max_weight)
+        vtrace_targets, advantages, truncated_ratios, action_ratios = calc_vtrace_targets(values, rewards, dones, log_probs, old_log_probs)
+        critic_loss = 0.5 * (vtrace_targets[:-1] - values[:-1]).square().mean()
+        policy_loss = -(truncated_ratios * advantages * log_probs).mean()
 
-        next_nonterminal = 1 - dones[1:]
-        td_delta = rewards + (next_nonterminal * HP.discount_gamma * values[1:].detach()) - values[:-1]
-
-        value_deltas = torch.zeros((HP.n_steps+1, HP.n_envs), dtype=torch.float32, device=HP.device)
-        for t in reversed(range(HP.n_steps)):
-            value_deltas[t] = truncated_ratios[t] * (next_nonterminal[t] * HP.discount_gamma * value_deltas[t+1] + td_delta[t])
-
-        critic_loss = 0.5 * value_deltas[:-1].square().mean()
-
-        # Policy update.
-        with torch.no_grad():
-            advantages = td_delta + (next_nonterminal * HP.discount_gamma * value_deltas[1:])
-        policy_loss = -(log_probs * advantages * truncated_ratios).mean()
-
-        # Optimize.
         loss = policy_loss + (HP.critic_loss_coeff * critic_loss) - (HP.entropy_coeff * entropy)
         optim.zero_grad(set_to_none=True)
         loss.backward()
@@ -212,9 +205,9 @@ for epoch in range(HP.n_epochs):
     log.add_scalar("loss/policy", policy_loss.item(), epoch)
     log.add_scalar("loss/critic", critic_loss.item(), epoch)
     log.add_scalar("loss/entropy", entropy.item(), epoch)
-    log.add_scalar("train/grad_norm", grad_norm, global_step=epoch)
+    log.add_scalar("train/grad_norm", grad_norm, epoch)
     log.add_scalar("train/lr", optim.param_groups[0]["lr"], epoch)
-    log.add_scalar("train/ratio", ratios.mean().item(), epoch)
+    log.add_scalar("train/action_ratios", action_ratios.mean().item(), epoch)
     print(f"{epoch}: reward={mean_total_reward}")
 
 log.close()
