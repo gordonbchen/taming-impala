@@ -2,7 +2,6 @@
 from dataclasses import dataclass
 import envpool
 import torch
-import numpy as np
 from cli_params import CLIParams
 from torch import Tensor
 from torch.distributions import Categorical
@@ -39,7 +38,7 @@ class HyperParams(CLIParams):
 
 @torch.no_grad()
 def sample_trajectories(
-        agent: Agent, envs, n_steps: int, action_map: np.ndarray, obs: Tensor, done: Tensor,
+        agent: Agent, envs, n_steps: int, obs: Tensor, done: Tensor,
         obss: Tensor, dones: Tensor, actions: Tensor, rewards: Tensor, old_log_probs: Tensor,
     ) -> tuple[float, int, int]:
     total_reward = 0.0
@@ -61,7 +60,7 @@ def sample_trajectories(
         actions[t] = action
         old_log_probs[t] = action_dist.log_prob(action)
 
-        obs, reward, terminated, truncated, info = envs.step(action_map[action.cpu().numpy()])
+        obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
         rewards[t] = torch.tensor(reward, dtype=torch.float32, device=rewards.device)
 
         obs = torch.tensor(obs, dtype=torch.float32, device=obss.device)
@@ -127,11 +126,9 @@ if __name__ == "__main__":
     # Create envs.
     envs = envpool.make_gymnasium("Pong-v5", num_envs=HP.n_envs)
     envs = EnvPoolEpisodeStats(envs, n_envs=HP.n_envs)
-    # 0 = NOOP, 1 = LEFT, 2 = RIGHT.
-    ACTION_MAP = np.array([0, 3, 2], dtype=np.int64)
 
     # Create agent.
-    agent = Agent(HP.n_frame_stack, len(ACTION_MAP)).to(device=HP.device)
+    agent = Agent(HP.n_frame_stack, envs.action_space.n).to(device=HP.device)
     agent.compile()
     optim = Adam(agent.parameters(), lr=HP.lr, fused=True)
 
@@ -152,7 +149,7 @@ if __name__ == "__main__":
     for epoch in range(HP.n_epochs):
         # Sample trajectories.
         total_reward, total_episode_length, n_episodes = sample_trajectories(
-            agent, envs, HP.n_steps, ACTION_MAP, obs, done, obss, dones, actions, rewards, old_log_probs
+            agent, envs, HP.n_steps, obs, done, obss, dones, actions, rewards, old_log_probs
         )
         mean_total_reward = None
         if n_episodes > 0:
