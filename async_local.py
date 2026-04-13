@@ -20,7 +20,7 @@ torch.set_float32_matmul_precision("high")
 @dataclass
 class HyperParams(CLIParams):
     # Actor.
-    n_actors: int = 5
+    n_actors: int = 4
     rollout_queue_size: int = 64
     n_rollout_steps: int = 64
     policy_sync_freq: int = 4
@@ -48,6 +48,8 @@ class HyperParams(CLIParams):
 
 
 def actor_func(actor_id: int, HP: HyperParams, rollout_queue: mp.Queue, weight_queue: mp.Queue, stop_event: EventClass):
+    rollout_queue.cancel_join_thread()  # Don't wait for queue to flush.
+    weight_queue.cancel_join_thread()
     print(f"HELLO from actor {actor_id}.")
 
     # Create envs.
