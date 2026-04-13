@@ -89,7 +89,7 @@ def actor_func(actor_id: int, HP: HyperParams, rollout_queue: mp.Queue, weight_q
                 agent.load_state_dict(state_dict)
                 agent.to(device=HP.device).eval()
 
-        mean_reward, mean_episode_length, n_episodes = sample_trajectories(
+        obs, done, mean_reward, mean_episode_length, n_episodes = sample_trajectories(
             agent, envs, HP.n_rollout_steps, obs, done, obss, dones, actions, rewards, old_log_probs
         )
         rollout = (actor_id, policy_version, mean_reward, mean_episode_length, n_episodes,
@@ -111,7 +111,7 @@ def actor_func(actor_id: int, HP: HyperParams, rollout_queue: mp.Queue, weight_q
 def sample_trajectories(
         agent: Agent, envs, n_rollout_steps: int, obs: Tensor, done: Tensor,
         obss: Tensor, dones: Tensor, actions: np.ndarray, rewards: np.ndarray, old_log_probs: np.ndarray,
-    ) -> tuple[float | None, float | None, int]:
+    ) -> tuple[Tensor, Tensor, float | None, float | None, int]:
     total_reward = 0.0
     total_episode_length = 0
     n_episodes = 0
@@ -147,11 +147,11 @@ def sample_trajectories(
 
     mean_reward = None if n_episodes == 0 else total_reward / n_episodes
     mean_episode_length = None if n_episodes == 0 else total_episode_length / n_episodes
-    return mean_reward, mean_episode_length, n_episodes
+    return obs, done, mean_reward, mean_episode_length, n_episodes
 
 
 def optimize_model(
-        agent: Agent, obss: Tensor, actions: Tensor, rewards: Tensor, dones: Tensor, old_log_probs: Tensor, HP: HyperParams
+        agent: Agent, optim: Adam, obss: Tensor, actions: Tensor, rewards: Tensor, dones: Tensor, old_log_probs: Tensor, HP: HyperParams
     ) -> tuple[float, float, float, float, float]:
     logits, values = agent(obss.reshape(-1, *obss.shape[2:]))
     logits, values = [t.view(-1, HP.n_envs, *t.shape[1:]) for t in (logits, values)]
@@ -227,10 +227,9 @@ if __name__ == "__main__":
 
         (actor_id, actor_policy_version, mean_reward, mean_episode_length, n_episodes,
          obss, dones, actions, rewards, old_log_probs) = rollout_queue.get()
-        obss, dones, actions, rewards, old_log_probs = [
-            torch.tensor(t, dtype=torch.float32, device=HP.device)
-            for t in (obss, dones, actions, rewards, old_log_probs)
-        ]
+        obss, dones, rewards, old_log_probs = [torch.tensor(t, dtype=torch.float32, device=HP.device)
+                                               for t in (obss, dones, rewards, old_log_probs)]
+        actions = torch.tensor(actions, dtype=torch.int64, device=HP.device)
 
         if n_episodes > 0:
             log.add_scalar("ep_stats/reward", mean_reward, epoch)
@@ -246,7 +245,7 @@ if __name__ == "__main__":
         # Optimize.
         for _ in range(HP.update_steps):
             policy_loss, critic_loss, entropy, grad_norm, mean_action_ratio = optimize_model(
-                agent, obss, actions, rewards, dones, old_log_probs, HP
+                agent, optim, obss, actions, rewards, dones, old_log_probs, HP
             )
         log.add_scalar("loss/policy", policy_loss, epoch)
         log.add_scalar("loss/critic", critic_loss, epoch)
