@@ -21,8 +21,8 @@ torch.set_float32_matmul_precision("high")
 class HyperParams(CLIParams):
     # Actor.
     n_actors: int = 4
-    n_rollout_steps: int = 64
-    rollout_queue_size: int = 64
+    n_rollout_steps: int = 128
+    rollout_queue_size: int = 32
     max_policy_lag: int = 8
 
     # Env.
@@ -31,8 +31,8 @@ class HyperParams(CLIParams):
     n_frame_stack: int = 4
 
     # Training.
-    n_epochs: int = 4000
-    lr: float = 3e-4
+    n_epochs: int = 16000
+    lr: float = 1e-3
     update_steps: int = 1
 
     discount_gamma: float = 0.99
