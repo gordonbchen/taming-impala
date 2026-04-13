@@ -254,7 +254,7 @@ if __name__ == "__main__":
             log.add_scalar("ep_stats/reward", mean_reward, epoch)
             log.add_scalar("ep_stats/length", mean_episode_length, epoch)
         log.add_scalar("ep_stats/episodes", n_episodes, epoch)
-        log.add_scalar("async/actor_policy_version", actor_policy_version, epoch)
+        log.add_scalar("async/policy_lag", policy_version - actor_policy_version, epoch)
         log.add_scalar("async/rollout_queue_len", rollout_queue.qsize(), epoch)
         print(f"{epoch}: reward={mean_reward}")
 
