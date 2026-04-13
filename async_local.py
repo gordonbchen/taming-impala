@@ -21,19 +21,19 @@ torch.set_float32_matmul_precision("high")
 class HyperParams(CLIParams):
     # Actor.
     n_actors: int = 4
-    rollout_queue_size: int = 64
     n_rollout_steps: int = 64
-    policy_sync_freq: int = 4
+    rollout_queue_size: int = 64
+    max_policy_lag: int = 8
 
     # Env.
+    env_name: str = "Pong-v5"
     n_envs: int = 16
     n_frame_stack: int = 4
-    env_name: str = "Pong-v5"
 
     # Training.
     n_epochs: int = 4000
-    update_steps: int = 4
     lr: float = 3e-4
+    update_steps: int = 1
 
     discount_gamma: float = 0.99
     impala_max_rho: float = 1.0
@@ -58,7 +58,9 @@ def actor_func(actor_id: int, HP: HyperParams, rollout_queue: mp.Queue, weight_q
 
     # Create agent.
     agent = Agent(HP.n_frame_stack, envs.action_space.n)
-    policy_version = -1
+    policy_version, state_dict = weight_queue.get()
+    agent.load_state_dict(state_dict)
+    agent.to(device=HP.device).eval()
 
     # Storage buffers.
     OBS_SHAPE = (HP.n_frame_stack, 84, 84)
@@ -74,39 +76,55 @@ def actor_func(actor_id: int, HP: HyperParams, rollout_queue: mp.Queue, weight_q
     obs = torch.tensor(obs, dtype=torch.float32, device=HP.device)
     done = torch.zeros(HP.n_envs, dtype=torch.float32, device=HP.device)
 
-    i = 0
     while not stop_event.is_set():
-        if i % HP.policy_sync_freq == 0:
-            while not stop_event.is_set():
-                try:
-                    learner_policy_version, state_dict = weight_queue.get(timeout=0.1)
-                    break
-                except Empty:
-                    continue
-            if stop_event.is_set():
-                break
-
-            if learner_policy_version != policy_version:
-                policy_version = learner_policy_version
-                agent.load_state_dict(state_dict)
-                agent.to(device=HP.device).eval()
+        policy_version = sync_weights(agent, weight_queue, policy_version, stop_event, HP.device)
 
         obs, done, mean_reward, mean_episode_length, n_episodes = sample_trajectories(
             agent, envs, HP.n_rollout_steps, obs, done, obss, dones, actions, rewards, old_log_probs
         )
         rollout = (actor_id, policy_version, mean_reward, mean_episode_length, n_episodes,
                    obss.cpu().to(dtype=torch.uint8).numpy(), dones.cpu().numpy(), actions, rewards, old_log_probs)
-        while not stop_event.is_set():
-            try:
-                rollout_queue.put(rollout, timeout=0.1)
-                break
-            except Full:
-                continue
-
-        i += 1
+        push_replace_queue(rollout, rollout_queue)
 
     envs.close()
     print(f"GOODBYE from actor {actor_id}.")
+
+
+def sync_weights(agent: Agent, weight_queue: mp.Queue, policy_version: int, stop_event: EventClass, device: str) -> int:
+    if stop_event.is_set():
+        return policy_version
+
+    try:
+        learner_policy_version, state_dict = weight_queue.get(block=False)
+    except Empty:
+        return policy_version
+
+    while not stop_event.is_set():
+        try:
+            learner_policy_version, state_dict = weight_queue.get(block=False)
+        except Empty:
+            break
+
+    if stop_event.is_set() or (learner_policy_version == policy_version):
+        return policy_version
+
+    agent.load_state_dict(state_dict)
+    agent.to(device=device).eval()
+    return learner_policy_version
+
+
+def push_replace_queue(payload, queue: mp.Queue):
+    try:
+        queue.put(payload, block=False)
+    except Full:
+        try:
+            queue.get(block=False)
+        except Empty:
+            pass
+        try:
+            queue.put(payload, block=False)
+        except Full:
+            pass
 
 
 @torch.no_grad()
@@ -214,21 +232,20 @@ if __name__ == "__main__":
     envs = envpool.make_gymnasium(HP.env_name, num_envs=1)  # TODO: make this exactly like actor env?
     agent = Agent(HP.n_frame_stack, envs.action_space.n).to(device=HP.device)
     optim = Adam(agent.parameters(), lr=HP.lr, fused=True)
-    policy_version = 0
+    policy_version = -1
 
     log = SummaryWriter(log_dir=HP.output_dir)
     for epoch in range(HP.n_epochs):
-        # Try to give actors new weights. If prev weights not consumed, just wait.
-        new_weights = (policy_version, agent.state_dict())
-        for weight_queue in weight_queues:
-            try:
-                weight_queue.put(new_weights, block=False)
-            except Full:
-                pass
         policy_version += 1
+        new_weights = (policy_version, {k: v.detach().cpu() for k, v in agent.state_dict().items()})
+        for weight_queue in weight_queues:
+            push_replace_queue(new_weights, weight_queue)
 
-        (actor_id, actor_policy_version, mean_reward, mean_episode_length, n_episodes,
-         obss, dones, actions, rewards, old_log_probs) = rollout_queue.get()
+        while True:
+            (actor_id, actor_policy_version, mean_reward, mean_episode_length, n_episodes,
+            obss, dones, actions, rewards, old_log_probs) = rollout_queue.get()
+            if policy_version - actor_policy_version <= HP.max_policy_lag:
+                break
         obss, dones, rewards, old_log_probs = [torch.tensor(t, dtype=torch.float32, device=HP.device)
                                                for t in (obss, dones, rewards, old_log_probs)]
         actions = torch.tensor(actions, dtype=torch.int64, device=HP.device)
@@ -257,6 +274,7 @@ if __name__ == "__main__":
         log.add_scalar("train/action_ratios", mean_action_ratio, epoch)
 
     # Cleanup.
+    envs.close()
     log.close()
     stop_event.set()
     print("STOP issued, waiting for actors to terminate.")
