@@ -31,7 +31,7 @@ class HyperParams(CLIParams):
     n_frame_stack: int = 4
 
     # Training.
-    n_epochs: int = 16000
+    n_epochs: int = 8000
     lr: float = 1e-3
     update_steps: int = 1
 
