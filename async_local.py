@@ -21,7 +21,7 @@ torch.set_float32_matmul_precision("high")
 class HyperParams(CLIParams):
     # Actor.
     n_actors: int = 4
-    n_rollout_steps: int = 128
+    n_rollout_steps: int = 20
     rollout_queue_size: int = 32
     max_policy_lag: int = 8
 
@@ -32,7 +32,7 @@ class HyperParams(CLIParams):
 
     # Training.
     n_epochs: int = 8000
-    lr: float = 1e-3
+    lr: float = 3e-4
     update_steps: int = 1
 
     discount_gamma: float = 0.99
@@ -40,7 +40,7 @@ class HyperParams(CLIParams):
     impala_max_c: float = 1.0
     critic_loss_coeff: float = 0.5
     entropy_coeff: float = 0.01
-    max_grad_norm: float = 0.5
+    max_grad_norm: float = 1.0
 
     # Meta.
     device: str = "cuda"
@@ -60,12 +60,12 @@ def actor_func(actor_id: int, HP: HyperParams, rollout_queue: mp.Queue, weight_q
     agent = Agent(HP.n_frame_stack, envs.action_space.n)
     policy_version, state_dict = weight_queue.get()
     agent.load_state_dict(state_dict)
-    agent.to(device=HP.device).eval()
+    agent.eval()
 
     # Storage buffers.
     OBS_SHAPE = (HP.n_frame_stack, 84, 84)
-    obss = torch.zeros((HP.n_rollout_steps+1, HP.n_envs) + OBS_SHAPE, dtype=torch.float32, device=HP.device)
-    dones = torch.zeros((HP.n_rollout_steps+1, HP.n_envs), dtype=torch.float32, device=HP.device)
+    obss = torch.zeros((HP.n_rollout_steps+1, HP.n_envs) + OBS_SHAPE, dtype=torch.float32)
+    dones = torch.zeros((HP.n_rollout_steps+1, HP.n_envs), dtype=torch.float32)
 
     actions = np.zeros((HP.n_rollout_steps, HP.n_envs), dtype=np.int64)
     rewards = np.zeros((HP.n_rollout_steps, HP.n_envs), dtype=np.float32)
@@ -73,24 +73,24 @@ def actor_func(actor_id: int, HP: HyperParams, rollout_queue: mp.Queue, weight_q
 
     # Env init.
     obs, _ = envs.reset()
-    obs = torch.tensor(obs, dtype=torch.float32, device=HP.device)
-    done = torch.zeros(HP.n_envs, dtype=torch.float32, device=HP.device)
+    obs = torch.tensor(obs, dtype=torch.float32)
+    done = torch.zeros(HP.n_envs, dtype=torch.float32)
 
     while not stop_event.is_set():
-        policy_version = sync_weights(agent, weight_queue, policy_version, stop_event, HP.device)
+        policy_version = sync_weights(agent, weight_queue, policy_version, stop_event)
 
         obs, done, mean_reward, mean_episode_length, n_episodes = sample_trajectories(
             agent, envs, HP.n_rollout_steps, obs, done, obss, dones, actions, rewards, old_log_probs
         )
         rollout = (actor_id, policy_version, mean_reward, mean_episode_length, n_episodes,
-                   obss.cpu().to(dtype=torch.uint8).numpy(), dones.cpu().numpy(), actions, rewards, old_log_probs)
+                   obss.to(dtype=torch.uint8).numpy(), dones.numpy(), actions, rewards, old_log_probs)
         push_replace_queue(rollout, rollout_queue)
 
     envs.close()
     print(f"GOODBYE from actor {actor_id}.")
 
 
-def sync_weights(agent: Agent, weight_queue: mp.Queue, policy_version: int, stop_event: EventClass, device: str) -> int:
+def sync_weights(agent: Agent, weight_queue: mp.Queue, policy_version: int, stop_event: EventClass) -> int:
     if stop_event.is_set():
         return policy_version
 
@@ -109,7 +109,7 @@ def sync_weights(agent: Agent, weight_queue: mp.Queue, policy_version: int, stop
         return policy_version
 
     agent.load_state_dict(state_dict)
-    agent.to(device=device).eval()
+    agent.eval()
     return learner_policy_version
 
 
@@ -148,14 +148,14 @@ def sample_trajectories(
         action_dist = Categorical(logits=logits)
         action = action_dist.sample()
 
-        actions[t] = action.cpu().numpy()
-        old_log_probs[t] = action_dist.log_prob(action).cpu().numpy()
+        actions[t] = action.numpy()
+        old_log_probs[t] = action_dist.log_prob(action).numpy()
 
-        obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
+        obs, reward, terminated, truncated, info = envs.step(action.numpy())
         rewards[t] = reward
 
-        obs = torch.tensor(obs, dtype=torch.float32, device=obss.device)
-        done = torch.tensor(terminated | truncated, dtype=torch.float32, device=dones.device)
+        obs = torch.tensor(obs, dtype=torch.float32)
+        done = torch.tensor(terminated | truncated, dtype=torch.float32)
         obss[t+1] = obs
         dones[t+1] = done
 
