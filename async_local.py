@@ -173,6 +173,12 @@ def sample_trajectories(
 def optimize_model(
         agent: Agent, optim: Adam, obss: Tensor, actions: Tensor, rewards: Tensor, dones: Tensor, old_log_probs: Tensor, HP: HyperParams
     ) -> tuple[float, float, float, float, float]:
+    # import matplotlib.pyplot as plt
+    # for t in range(obss.shape[0]):
+    #     fig, axs = plt.subplots(ncols=HP.n_frame_stack)
+    #     for f in range(HP.n_frame_stack):
+    #         axs[f].imshow(obss.cpu().numpy()[t, 0, f], cmap="gray")
+    #     plt.show()
     logits, values = agent(obss.reshape(-1, *obss.shape[2:]))
     logits, values = [t.view(-1, HP.n_envs, *t.shape[1:]) for t in (logits, values)]
     action_dist = Categorical(logits=logits[:-1])
