@@ -34,6 +34,7 @@ class HyperParams(CLIParams):
     n_epochs: int = 8000
     lr: float = 3e-4
     update_steps: int = 1
+    batch_rollouts: int = 32
 
     discount_gamma: float = 0.99
     impala_max_rho: float = 1.0
@@ -45,6 +46,9 @@ class HyperParams(CLIParams):
     # Meta.
     device: str = "cuda"
     output_dir: str = "runs/test"
+
+    def check_args(self):
+        assert self.batch_rollouts % self.n_envs == 0
 
 
 def actor_func(actor_id: int, HP: HyperParams, rollout_queue: mp.Queue, weight_queue: mp.Queue, stop_event: EventClass):
@@ -76,15 +80,19 @@ def actor_func(actor_id: int, HP: HyperParams, rollout_queue: mp.Queue, weight_q
     obs = torch.tensor(obs, dtype=torch.float32)
     done = torch.zeros(HP.n_envs, dtype=torch.float32)
 
+    n_rollout = 0
     while not stop_event.is_set():
         policy_version = sync_weights(agent, weight_queue, policy_version, stop_event)
 
-        obs, done, mean_reward, mean_episode_length, n_episodes = sample_trajectories(
+        obs, done, total_reward, n_episodes = sample_trajectories(
             agent, envs, HP.n_rollout_steps, obs, done, obss, dones, actions, rewards, old_log_probs
         )
-        rollout = (actor_id, policy_version, mean_reward, mean_episode_length, n_episodes,
-                   obss.to(dtype=torch.uint8).numpy(), dones.numpy(), actions, rewards, old_log_probs)
+        rollout = {"actor_id": actor_id, "policy_version": policy_version, "n_rollout": n_rollout,
+                   "total_reward": total_reward, "n_episodes": n_episodes,
+                   "obss": obss.to(dtype=torch.uint8).numpy(), "dones": dones.numpy(), "actions": actions,
+                   "rewards": rewards, "old_log_probs": old_log_probs}
         push_replace_queue(rollout, rollout_queue)
+        n_rollout += 1
 
     envs.close()
     print(f"GOODBYE from actor {actor_id}.")
@@ -131,9 +139,8 @@ def push_replace_queue(payload, queue: mp.Queue):
 def sample_trajectories(
         agent: Agent, envs, n_rollout_steps: int, obs: Tensor, done: Tensor,
         obss: Tensor, dones: Tensor, actions: np.ndarray, rewards: np.ndarray, old_log_probs: np.ndarray,
-    ) -> tuple[Tensor, Tensor, float | None, float | None, int]:
+    ) -> tuple[Tensor, Tensor, float, float]:
     total_reward = 0.0
-    total_episode_length = 0
     n_episodes = 0
 
     # obs and done continue from prev epoch
@@ -162,12 +169,36 @@ def sample_trajectories(
         if "stats" in info:
             done_mask = info["stats"]["done_mask"]
             total_reward += info["stats"]["returns"][done_mask].sum()
-            total_episode_length += info["stats"]["lens"][done_mask].sum()
             n_episodes += int(done_mask.sum())
+    return obs, done, total_reward, n_episodes
 
-    mean_reward = None if n_episodes == 0 else total_reward / n_episodes
-    mean_episode_length = None if n_episodes == 0 else total_episode_length / n_episodes
-    return obs, done, mean_reward, mean_episode_length, n_episodes
+
+def receive_rollouts(rollout_queue: mp.Queue, policy_version: int, HP: HyperParams):
+    batches = None
+    n_batches = 0
+    stale_rollouts = 0
+    while n_batches < HP.batch_rollouts // HP.n_envs:
+        batch = rollout_queue.get()
+        if policy_version - batch["policy_version"] > HP.max_policy_lag:
+            stale_rollouts += 1
+            continue
+        if batches is None:
+            batches = {k: [] for k in batch}
+        for k in batch:
+            batches[k].append(batch[k])
+        n_batches += 1
+
+    actor_policy_version, total_reward, n_episodes = [np.array(batches[k]) for k in ("policy_version", "total_reward", "n_episodes")]
+    actor_policy_version = actor_policy_version.mean()
+    n_episodes = n_episodes.sum()
+    mean_reward = None if n_episodes == 0 else total_reward.sum() / n_episodes
+
+    obss, dones, rewards, old_log_probs = [
+        torch.tensor(np.concat(batches[k], axis=1), dtype=torch.float32, device=HP.device)
+        for k in ("obss", "dones", "rewards", "old_log_probs")
+    ]
+    actions = torch.tensor(np.concat(batches["actions"], axis=1), dtype=torch.int64, device=HP.device)
+    return actor_policy_version, mean_reward, n_episodes, obss, dones, actions, rewards, old_log_probs, stale_rollouts
 
 
 def optimize_model(
@@ -180,7 +211,7 @@ def optimize_model(
     #         axs[f].imshow(obss.cpu().numpy()[t, 0, f], cmap="gray")
     #     plt.show()
     logits, values = agent(obss.reshape(-1, *obss.shape[2:]))
-    logits, values = [t.view(-1, HP.n_envs, *t.shape[1:]) for t in (logits, values)]
+    logits, values = [t.view(-1, obss.shape[1], *t.shape[1:]) for t in (logits, values)]
     action_dist = Categorical(logits=logits[:-1])
     log_probs = action_dist.log_prob(actions)
     entropy = action_dist.entropy().mean()
@@ -246,21 +277,14 @@ if __name__ == "__main__":
         new_weights = (policy_version, {k: v.detach().cpu() for k, v in agent.state_dict().items()})
         for weight_queue in weight_queues:
             push_replace_queue(new_weights, weight_queue)
-
-        while True:
-            (actor_id, actor_policy_version, mean_reward, mean_episode_length, n_episodes,
-            obss, dones, actions, rewards, old_log_probs) = rollout_queue.get()
-            if policy_version - actor_policy_version <= HP.max_policy_lag:
-                break
-        obss, dones, rewards, old_log_probs = [torch.tensor(t, dtype=torch.float32, device=HP.device)
-                                               for t in (obss, dones, rewards, old_log_probs)]
-        actions = torch.tensor(actions, dtype=torch.int64, device=HP.device)
-
+        
+        (actor_policy_version, mean_reward, n_episodes, obss, dones,
+         actions, rewards, old_log_probs, stale_rollouts) = receive_rollouts(rollout_queue, policy_version, HP)
         if n_episodes > 0:
             log.add_scalar("ep_stats/reward", mean_reward, epoch)
-            log.add_scalar("ep_stats/length", mean_episode_length, epoch)
         log.add_scalar("ep_stats/episodes", n_episodes, epoch)
         log.add_scalar("async/policy_lag", policy_version - actor_policy_version, epoch)
+        log.add_scalar("async/stale_rollouts", stale_rollouts, epoch)
         log.add_scalar("async/rollout_queue_len", rollout_queue.qsize(), epoch)
         print(f"{epoch}: reward={mean_reward}")
 
