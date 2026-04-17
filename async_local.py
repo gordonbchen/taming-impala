@@ -31,7 +31,7 @@ class HyperParams(CLIParams):
     n_frame_stack: int = 4
 
     # Training.
-    n_epochs: int = 8000
+    train_steps: int = 5_000_000
     lr: float = 3e-4
     update_steps: int = 1
     batch_rollouts: int = 32
@@ -143,7 +143,7 @@ def sample_trajectories(
     total_reward = 0.0
     n_episodes = 0
 
-    # obs and done continue from prev epoch
+    # obs and done continue from prev samples.
     obss[0] = obs
     dones[0] = done
 
@@ -272,36 +272,39 @@ if __name__ == "__main__":
     policy_version = -1
 
     log = SummaryWriter(log_dir=HP.output_dir)
-    for epoch in range(HP.n_epochs):
+    global_step = 0
+    while global_step < HP.train_steps:
         policy_version += 1
         new_weights = (policy_version, {k: v.detach().cpu() for k, v in agent.state_dict().items()})
         for weight_queue in weight_queues:
             push_replace_queue(new_weights, weight_queue)
-        
+
         (actor_policy_version, mean_reward, n_episodes, obss, dones,
          actions, rewards, old_log_probs, stale_rollouts) = receive_rollouts(rollout_queue, policy_version, HP)
         if n_episodes > 0:
-            log.add_scalar("ep_stats/reward", mean_reward, epoch)
-        log.add_scalar("ep_stats/episodes", n_episodes, epoch)
-        log.add_scalar("async/policy_lag", policy_version - actor_policy_version, epoch)
-        log.add_scalar("async/stale_rollouts", stale_rollouts, epoch)
-        log.add_scalar("async/rollout_queue_len", rollout_queue.qsize(), epoch)
-        print(f"{epoch}: reward={mean_reward}")
+            log.add_scalar("ep_stats/reward", mean_reward, global_step)
+        log.add_scalar("ep_stats/episodes", n_episodes, global_step)
+        log.add_scalar("async/policy_lag", policy_version - actor_policy_version, global_step)
+        log.add_scalar("async/stale_rollouts", stale_rollouts, global_step)
+        log.add_scalar("async/rollout_queue_len", rollout_queue.qsize(), global_step)
+        print(f"{global_step}: reward={mean_reward}")
 
         # Linearly decay lr to 0.
-        optim.param_groups[0]["lr"] = HP.lr - (HP.lr / HP.n_epochs) * epoch
+        optim.param_groups[0]["lr"] = HP.lr - HP.lr * (global_step / HP.train_steps)
 
         # Optimize.
         for _ in range(HP.update_steps):
             policy_loss, critic_loss, entropy, grad_norm, mean_action_ratio = optimize_model(
                 agent, optim, obss, actions, rewards, dones, old_log_probs, HP
             )
-        log.add_scalar("loss/policy", policy_loss, epoch)
-        log.add_scalar("loss/critic", critic_loss, epoch)
-        log.add_scalar("loss/entropy", entropy, epoch)
-        log.add_scalar("train/grad_norm", grad_norm, epoch)
-        log.add_scalar("train/lr", optim.param_groups[0]["lr"], epoch)
-        log.add_scalar("train/action_ratios", mean_action_ratio, epoch)
+        log.add_scalar("loss/policy", policy_loss, global_step)
+        log.add_scalar("loss/critic", critic_loss, global_step)
+        log.add_scalar("loss/entropy", entropy, global_step)
+        log.add_scalar("train/grad_norm", grad_norm, global_step)
+        log.add_scalar("train/lr", optim.param_groups[0]["lr"], global_step)
+        log.add_scalar("train/action_ratios", mean_action_ratio, global_step)
+
+        global_step += actions.numel()
 
     # Cleanup.
     envs.close()
