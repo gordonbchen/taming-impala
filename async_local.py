@@ -20,8 +20,8 @@ torch.set_float32_matmul_precision("high")
 @dataclass
 class HyperParams(CLIParams):
     # Actor.
-    n_actors: int = 4
-    n_rollout_steps: int = 20
+    n_actors: int = 1
+    n_rollout_steps: int = 128
     rollout_queue_size: int = 32
     max_policy_lag: int = 8
 
@@ -31,9 +31,9 @@ class HyperParams(CLIParams):
     n_frame_stack: int = 4
 
     # Training.
-    train_steps: int = 5_000_000
-    lr: float = 3e-4
-    update_steps: int = 1
+    train_steps: int = 8_000_000
+    lr: float = 1e-3
+    update_steps: int = 4
     batch_rollouts: int = 1
 
     discount_gamma: float = 0.99
@@ -41,7 +41,7 @@ class HyperParams(CLIParams):
     impala_max_c: float = 1.0
     critic_loss_coeff: float = 0.5
     entropy_coeff: float = 0.01
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 0.5
 
     # Meta.
     device: str = "cuda"
