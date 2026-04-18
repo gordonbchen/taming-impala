@@ -21,7 +21,7 @@ class HyperParams(CLIParams):
     n_envs: int = 16
     device: str = "cuda"
 
-    lr: float = 3e-4
+    lr: float = 1e-3
     update_steps: int = 4
 
     discount_gamma: float = 0.99
@@ -40,7 +40,7 @@ class HyperParams(CLIParams):
 def sample_trajectories(
         agent: Agent, envs, n_steps: int, obs: Tensor, done: Tensor,
         obss: Tensor, dones: Tensor, actions: Tensor, rewards: Tensor, old_log_probs: Tensor,
-    ) -> tuple[float, int, int]:
+    ) -> tuple[Tensor, Tensor, float, int, int]:
     total_reward = 0.0
     total_episode_length = 0
     n_episodes = 0
@@ -74,7 +74,7 @@ def sample_trajectories(
             total_episode_length += info["stats"]["lens"][done_mask].sum()
             n_episodes += int(done_mask.sum())
 
-    return total_reward, total_episode_length, n_episodes
+    return obs, done, total_reward, total_episode_length, n_episodes
 
 
 def optimize_model(
@@ -148,7 +148,7 @@ if __name__ == "__main__":
     log = SummaryWriter(log_dir=HP.output_dir)
     for epoch in range(HP.n_epochs):
         # Sample trajectories.
-        total_reward, total_episode_length, n_episodes = sample_trajectories(
+        obs, done, total_reward, total_episode_length, n_episodes = sample_trajectories(
             agent, envs, HP.n_steps, obs, done, obss, dones, actions, rewards, old_log_probs
         )
         mean_total_reward = None
