@@ -16,8 +16,8 @@ torch.set_float32_matmul_precision("high")
 
 @dataclass
 class HyperParams(CLIParams):
-    n_epochs: int = 4000
-    n_steps: int = 128
+    train_steps: int = 8_000_000
+    n_rollout_steps: int = 128
     n_envs: int = 16
     device: str = "cuda"
 
@@ -45,7 +45,7 @@ def sample_trajectories(
     total_episode_length = 0
     n_episodes = 0
 
-    # obs and done continue from prev epoch
+    # obs and done continue from prev samples.
     obss[0] = obs
     dones[0] = done
 
@@ -111,7 +111,7 @@ def calc_vtrace_targets(
     c = action_ratios.clamp(max=HP.impala_max_c)
 
     vtrace_deltas = torch.zeros_like(values)
-    for t in reversed(range(HP.n_steps)):
+    for t in reversed(range(HP.n_rollout_steps)):
         vtrace_deltas[t] = rho[t] * td_deltas[t] + next_nonterminal[t] * HP.discount_gamma * c[t] * vtrace_deltas[t+1]
     vtrace_targets = vtrace_deltas + values
 
@@ -134,11 +134,11 @@ if __name__ == "__main__":
 
     # Storage buffers.
     OBS_SHAPE = (HP.n_frame_stack, 84, 84)
-    obss = torch.zeros((HP.n_steps+1, HP.n_envs) + OBS_SHAPE, dtype=torch.float32, device=HP.device)
-    dones = torch.zeros((HP.n_steps+1, HP.n_envs), dtype=torch.float32, device=HP.device)
-    actions = torch.zeros((HP.n_steps, HP.n_envs), dtype=torch.int64, device=HP.device)
-    rewards = torch.zeros((HP.n_steps, HP.n_envs), dtype=torch.float32, device=HP.device)
-    old_log_probs = torch.zeros((HP.n_steps, HP.n_envs), dtype=torch.float32, device=HP.device)
+    obss = torch.zeros((HP.n_rollout_steps+1, HP.n_envs) + OBS_SHAPE, dtype=torch.float32, device=HP.device)
+    dones = torch.zeros((HP.n_rollout_steps+1, HP.n_envs), dtype=torch.float32, device=HP.device)
+    actions = torch.zeros((HP.n_rollout_steps, HP.n_envs), dtype=torch.int64, device=HP.device)
+    rewards = torch.zeros((HP.n_rollout_steps, HP.n_envs), dtype=torch.float32, device=HP.device)
+    old_log_probs = torch.zeros((HP.n_rollout_steps, HP.n_envs), dtype=torch.float32, device=HP.device)
 
     # Env init.
     obs, _ = envs.reset()
@@ -146,33 +146,36 @@ if __name__ == "__main__":
     done = torch.zeros(HP.n_envs, dtype=torch.float32, device=HP.device)
 
     log = SummaryWriter(log_dir=HP.output_dir)
-    for epoch in range(HP.n_epochs):
+    global_step = 0
+    while global_step < HP.train_steps:
         # Sample trajectories.
         obs, done, total_reward, total_episode_length, n_episodes = sample_trajectories(
-            agent, envs, HP.n_steps, obs, done, obss, dones, actions, rewards, old_log_probs
+            agent, envs, HP.n_rollout_steps, obs, done, obss, dones, actions, rewards, old_log_probs
         )
         mean_total_reward = None
         if n_episodes > 0:
             mean_total_reward = total_reward / n_episodes
-            log.add_scalar("ep_stats/reward", mean_total_reward, epoch)
-            log.add_scalar("ep_stats/length", total_episode_length / n_episodes, epoch)
-        log.add_scalar("ep_stats/episodes", n_episodes, epoch)
-        print(f"{epoch}: reward={mean_total_reward}")
+            log.add_scalar("ep_stats/reward", mean_total_reward, global_step)
+            log.add_scalar("ep_stats/length", total_episode_length / n_episodes, global_step)
+        log.add_scalar("ep_stats/episodes", n_episodes, global_step)
+        print(f"{global_step}: reward={mean_total_reward}")
 
         # Linearly decay lr to 0.
-        optim.param_groups[0]["lr"] = HP.lr - (HP.lr / HP.n_epochs) * epoch
+        optim.param_groups[0]["lr"] = HP.lr - HP.lr * (global_step / HP.train_steps)
 
         # Optimize.
         for _ in range(HP.update_steps):
             policy_loss, critic_loss, entropy, grad_norm, mean_action_ratio = optimize_model(
                 agent, obss, actions, rewards, dones, old_log_probs, HP
             )
-        log.add_scalar("loss/policy", policy_loss, epoch)
-        log.add_scalar("loss/critic", critic_loss, epoch)
-        log.add_scalar("loss/entropy", entropy, epoch)
-        log.add_scalar("train/grad_norm", grad_norm, epoch)
-        log.add_scalar("train/lr", optim.param_groups[0]["lr"], epoch)
-        log.add_scalar("train/action_ratios", mean_action_ratio, epoch)
+        log.add_scalar("loss/policy", policy_loss, global_step)
+        log.add_scalar("loss/critic", critic_loss, global_step)
+        log.add_scalar("loss/entropy", entropy, global_step)
+        log.add_scalar("train/grad_norm", grad_norm, global_step)
+        log.add_scalar("train/lr", optim.param_groups[0]["lr"], global_step)
+        log.add_scalar("train/action_ratios", mean_action_ratio, global_step)
+
+        global_step += actions.numel()
 
     log.close()
     envs.close()
