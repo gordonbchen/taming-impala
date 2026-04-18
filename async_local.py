@@ -34,7 +34,7 @@ class HyperParams(CLIParams):
     train_steps: int = 5_000_000
     lr: float = 3e-4
     update_steps: int = 1
-    batch_rollouts: int = 32
+    batch_rollouts: int = 1
 
     discount_gamma: float = 0.99
     impala_max_rho: float = 1.0
@@ -46,9 +46,6 @@ class HyperParams(CLIParams):
     # Meta.
     device: str = "cuda"
     output_dir: str = "runs/test"
-
-    def check_args(self):
-        assert self.batch_rollouts % self.n_envs == 0
 
 
 def actor_func(actor_id: int, HP: HyperParams, rollout_queue: mp.Queue, weight_queue: mp.Queue, stop_event: EventClass):
@@ -177,7 +174,7 @@ def receive_rollouts(rollout_queue: mp.Queue, policy_version: int, HP: HyperPara
     batches = None
     n_batches = 0
     stale_rollouts = 0
-    while n_batches < HP.batch_rollouts // HP.n_envs:
+    while n_batches < HP.batch_rollouts:
         batch = rollout_queue.get()
         if policy_version - batch["policy_version"] > HP.max_policy_lag:
             stale_rollouts += 1
