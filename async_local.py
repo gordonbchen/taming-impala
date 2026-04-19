@@ -30,12 +30,17 @@ class HyperParams(CLIParams):
     n_envs: int = 16
     n_frame_stack: int = 4
 
+    # Optim.
+    lr: float = 1e-3
+    adam_beta1: float = 0.5
+    adam_beta2: float = 0.9
+
     # Training.
     train_steps: int = 8_000_000
-    lr: float = 1e-3
     update_steps: int = 4
     batch_rollouts: int = 1
 
+    # Impala.
     discount_gamma: float = 0.99
     impala_max_rho: float = 1.0
     impala_max_c: float = 1.0
@@ -265,7 +270,7 @@ if __name__ == "__main__":
     # Create agent.
     envs = envpool.make_gymnasium(HP.env_name, num_envs=1)  # TODO: make this exactly like actor env?
     agent = Agent(HP.n_frame_stack, envs.action_space.n).to(device=HP.device)
-    optim = Adam(agent.parameters(), lr=HP.lr, fused=True)
+    optim = Adam(agent.parameters(), lr=HP.lr, betas=(HP.adam_beta1, HP.adam_beta2), fused=True)
     policy_version = -1
 
     log = SummaryWriter(log_dir=HP.output_dir)
