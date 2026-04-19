@@ -20,7 +20,7 @@ torch.set_float32_matmul_precision("high")
 @dataclass
 class HyperParams(CLIParams):
     # Actor.
-    n_actors: int = 1
+    n_actors: int = 2
     n_rollout_steps: int = 32
     rollout_queue_size: int = 32
     max_policy_lag: int = 8
@@ -32,12 +32,12 @@ class HyperParams(CLIParams):
 
     # Optim.
     lr: float = 1e-3
-    adam_beta1: float = 0.2
+    adam_beta1: float = 0.1
     adam_beta2: float = 0.5
 
     # Training.
-    train_steps: int = 8_000_000
-    update_steps: int = 1
+    train_steps: int = 5_000_000
+    update_steps: int = 2
     batch_rollouts: int = 1
 
     # Impala.
