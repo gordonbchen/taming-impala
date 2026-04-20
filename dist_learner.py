@@ -78,6 +78,7 @@ def actor_handler(conn: socket.socket, addr, rollout_queue: queue.Queue):
                 for k in ("obss", "dones", "actions", "rewards", "old_log_probs"):
                     msg[k] = deserialize_np(msg[k])
                 rollout_queue.put(msg)
+                send_msg(conn, {"type": MessageType.ACK})
             else:
                 raise ValueError(f"Unknown message type: {msg['type']}.")
     except ConnectionError:

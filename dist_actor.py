@@ -121,8 +121,10 @@ if __name__ == "__main__":
 
         try:
             send_msg(sock, rollout)
+            msg = recv_msg(sock)
         except ConnectionError as e:
             break
+        assert msg["type"] == MessageType.ACK
         n_rollout += 1
         print(f"Sent rollouts: {n_rollout}")
 

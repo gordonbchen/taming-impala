@@ -8,6 +8,7 @@ class MessageType:
     GET_WEIGHTS = 0
     WEIGHTS = 1
     ROLLOUT = 2
+    ACK = 3
 
 
 HEADER_LEN = 8
