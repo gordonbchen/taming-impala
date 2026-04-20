@@ -9,7 +9,7 @@ from torch.distributions import Categorical
 from agent import Agent
 from env import EnvPoolEpisodeStats
 from dist_network import send_msg, recv_msg, serialize_np, deserialize_np, MessageType
-from dist_learner import DistSettings
+from dist_settings import DistSettings
 
 
 ROLLOUT_STEPS = 32
@@ -22,7 +22,7 @@ def get_weights(sock: socket.socket, agent: Agent, actor_policy_version: int) ->
     if msg["policy_version"] == actor_policy_version:
         return actor_policy_version
 
-    state_dict = {k: torch.tensor(deserialize_np(v)) for k, v in msg["state_dict"].items()}
+    state_dict = {k: torch.from_numpy(deserialize_np(v)) for k, v in msg["state_dict"].items()}
     agent.load_state_dict(state_dict)
     agent.eval()
     return msg["policy_version"]

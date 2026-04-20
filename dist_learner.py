@@ -51,6 +51,7 @@ latest_weights_lock = threading.Lock()
 
 def conn_handler(host: str, port: int, rollout_queue: queue.Queue):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, port))
     sock.listen()
     while True:
@@ -61,20 +62,27 @@ def conn_handler(host: str, port: int, rollout_queue: queue.Queue):
 
 def actor_handler(conn: socket.socket, addr, rollout_queue: queue.Queue):
     print(f"CONNECTED to actor: {addr}.")
-    while True:
-        msg = recv_msg(conn)
-        if msg["type"] == MessageType.GET_WEIGHTS:
-            while policy_version == -1:
-                time.sleep(0.1)
-            with latest_weights_lock:
-                send_msg(conn, {"type": MessageType.WEIGHTS, "policy_version": policy_version, "state_dict": latest_weights})
-        elif msg["type"] == MessageType.ROLLOUT:
-            del msg["type"]
-            for k in ("obss", "dones", "actions", "rewards", "old_log_probs"):
-                msg[k] = deserialize_np(msg[k])
-            rollout_queue.put(msg)
-        else:
-            raise ValueError(f"Unknown message type: {msg["type"]}.")
+    try:
+        while True:
+            msg = recv_msg(conn)
+            if msg["type"] == MessageType.GET_WEIGHTS:
+                while policy_version == -1:
+                    time.sleep(0.1)
+                if msg["policy_version"] == policy_version:
+                    send_msg(conn, {"type": MessageType.WEIGHTS, "policy_version": policy_version})
+                else:
+                    with latest_weights_lock:
+                        send_msg(conn, {"type": MessageType.WEIGHTS, "policy_version": policy_version, "state_dict": latest_weights})
+            elif msg["type"] == MessageType.ROLLOUT:
+                del msg["type"]
+                for k in ("obss", "dones", "actions", "rewards", "old_log_probs"):
+                    msg[k] = deserialize_np(msg[k])
+                rollout_queue.put(msg)
+            else:
+                raise ValueError(f"Unknown message type: {msg['type']}.")
+    except ConnectionError:
+        print(f"DISCONNECTED: {addr}")
+        conn.close()
 
 
 def get_rollouts(rollout_queue: queue.Queue, policy_version: int, HP: HyperParams):
@@ -158,7 +166,7 @@ if __name__ == "__main__":
     HP = HyperParams()
 
     rollout_queue = queue.Queue(maxsize=32)
-    conn_thread = threading.Thread(target=conn_handler, args=(DistSettings.HOST, DistSettings.PORT, rollout_queue))
+    conn_thread = threading.Thread(target=conn_handler, args=(DistSettings.HOST, DistSettings.PORT, rollout_queue), daemon=True)
     conn_thread.start()
 
     envs = envpool.make_gymnasium(DistSettings.ENV_NAME, num_envs=1)  # TODO: make this exactly like actor env?
