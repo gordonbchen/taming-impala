@@ -1,8 +1,5 @@
-"""IMPALA: https://arxiv.org/pdf/1802.01561."""
-import multiprocessing as mp
-from multiprocessing.synchronize import Event as EventClass
+import queue
 from dataclasses import dataclass
-from queue import Full, Empty
 import envpool
 import torch
 import numpy as np
@@ -10,25 +7,28 @@ from torch import Tensor
 from torch.distributions import Categorical
 from torch.optim import Adam
 from torch.utils.tensorboard import SummaryWriter
-from cli_params import CLIParams
 from agent import Agent
-from env import EnvPoolEpisodeStats
+from cli_params import CLIParams
 
 torch.set_float32_matmul_precision("high")
 
 
-@dataclass
-class HyperParams(CLIParams):
-    # Actor.
-    n_actors: int = 2
-    n_rollout_steps: int = 32
-    rollout_queue_size: int = 32
-    max_policy_lag: int = 8
+class DistSettings:
+    # Network.
+    HOST = "127.0.0.1"
+    PORT = 6767
 
     # Env.
-    env_name: str = "Pong-v5"
-    n_envs: int = 16
-    n_frame_stack: int = 4
+    ENV_NAME = "Pong-v5"
+    N_FRAME_STACK = 4
+    OBS_SHAPE = (N_FRAME_STACK, 84, 84)
+    
+    ROLLOUT_STEPS = 32
+
+
+@dataclass
+class HyperParams(CLIParams):
+    max_policy_lag: int = 8
 
     # Optim.
     lr: float = 1e-3
@@ -51,128 +51,6 @@ class HyperParams(CLIParams):
     # Meta.
     device: str = "cuda"
     output_dir: str = "runs/test"
-
-
-def actor_func(actor_id: int, HP: HyperParams, rollout_queue: mp.Queue, weight_queue: mp.Queue, stop_event: EventClass):
-    rollout_queue.cancel_join_thread()  # Don't wait for queue to flush.
-    weight_queue.cancel_join_thread()
-    print(f"HELLO from actor {actor_id}.")
-
-    # Create envs.
-    envs = envpool.make_gymnasium(HP.env_name, num_envs=HP.n_envs)
-    envs = EnvPoolEpisodeStats(envs, n_envs=HP.n_envs)
-
-    # Create agent.
-    agent = Agent(HP.n_frame_stack, envs.action_space.n)
-    policy_version, state_dict = weight_queue.get()
-    agent.load_state_dict(state_dict)
-    agent.eval()
-
-    # Storage buffers.
-    OBS_SHAPE = (HP.n_frame_stack, 84, 84)
-    obss = torch.zeros((HP.n_rollout_steps+1, HP.n_envs) + OBS_SHAPE, dtype=torch.float32)
-    dones = torch.zeros((HP.n_rollout_steps+1, HP.n_envs), dtype=torch.float32)
-
-    actions = np.zeros((HP.n_rollout_steps, HP.n_envs), dtype=np.int64)
-    rewards = np.zeros((HP.n_rollout_steps, HP.n_envs), dtype=np.float32)
-    old_log_probs = np.zeros((HP.n_rollout_steps, HP.n_envs), dtype=np.float32)
-
-    # Env init.
-    obs, _ = envs.reset()
-    obs = torch.tensor(obs, dtype=torch.float32)
-    done = torch.zeros(HP.n_envs, dtype=torch.float32)
-
-    n_rollout = 0
-    while not stop_event.is_set():
-        policy_version = sync_weights(agent, weight_queue, policy_version, stop_event)
-
-        obs, done, total_reward, n_episodes = sample_trajectories(
-            agent, envs, HP.n_rollout_steps, obs, done, obss, dones, actions, rewards, old_log_probs
-        )
-        rollout = {"actor_id": actor_id, "policy_version": policy_version, "n_rollout": n_rollout,
-                   "total_reward": total_reward, "n_episodes": n_episodes,
-                   "obss": obss.to(dtype=torch.uint8).numpy(), "dones": dones.numpy(), "actions": actions,
-                   "rewards": rewards, "old_log_probs": old_log_probs}
-        push_replace_queue(rollout, rollout_queue)
-        n_rollout += 1
-
-    envs.close()
-    print(f"GOODBYE from actor {actor_id}.")
-
-
-def sync_weights(agent: Agent, weight_queue: mp.Queue, policy_version: int, stop_event: EventClass) -> int:
-    if stop_event.is_set():
-        return policy_version
-
-    try:
-        learner_policy_version, state_dict = weight_queue.get(block=False)
-    except Empty:
-        return policy_version
-
-    while not stop_event.is_set():
-        try:
-            learner_policy_version, state_dict = weight_queue.get(block=False)
-        except Empty:
-            break
-
-    if stop_event.is_set() or (learner_policy_version == policy_version):
-        return policy_version
-
-    agent.load_state_dict(state_dict)
-    agent.eval()
-    return learner_policy_version
-
-
-def push_replace_queue(payload, queue: mp.Queue):
-    try:
-        queue.put(payload, block=False)
-    except Full:
-        try:
-            queue.get(block=False)
-        except Empty:
-            pass
-        try:
-            queue.put(payload, block=False)
-        except Full:
-            pass
-
-
-@torch.no_grad()
-def sample_trajectories(
-        agent: Agent, envs, n_rollout_steps: int, obs: Tensor, done: Tensor,
-        obss: Tensor, dones: Tensor, actions: np.ndarray, rewards: np.ndarray, old_log_probs: np.ndarray,
-    ) -> tuple[Tensor, Tensor, float, float]:
-    total_reward = 0.0
-    n_episodes = 0
-
-    # obs and done continue from prev samples.
-    obss[0] = obs
-    dones[0] = done
-
-    for t in range(n_rollout_steps):
-        # import matplotlib.pyplot as plt
-        # plt.imshow(obs[0][0].cpu().numpy(), cmap="gray")
-        # plt.show()
-        logits = agent.get_action_logits(obs)
-        action_dist = Categorical(logits=logits)
-        action = action_dist.sample()
-
-        actions[t] = action.numpy()
-        old_log_probs[t] = action_dist.log_prob(action).numpy()
-
-        obs, reward, terminated, truncated, info = envs.step(action.numpy())
-        rewards[t] = reward
-
-        obs = torch.tensor(obs, dtype=torch.float32)
-        done = torch.tensor(terminated | truncated, dtype=torch.float32)
-        obss[t+1] = obs
-        dones[t+1] = done
-
-        if "stats" in info:
-            done_mask = info["stats"]["done_mask"]
-            total_reward += info["stats"]["returns"][done_mask].sum()
-            n_episodes += int(done_mask.sum())
-    return obs, done, total_reward, n_episodes
 
 
 def receive_rollouts(rollout_queue: mp.Queue, policy_version: int, HP: HyperParams):
@@ -243,7 +121,7 @@ def calc_vtrace_targets(
     c = action_ratios.clamp(max=HP.impala_max_c)
 
     vtrace_deltas = torch.zeros_like(values)
-    for t in reversed(range(HP.n_rollout_steps)):
+    for t in reversed(range(rho.shape[0])):
         vtrace_deltas[t] = rho[t] * td_deltas[t] + next_nonterminal[t] * HP.discount_gamma * c[t] * vtrace_deltas[t+1]
     vtrace_targets = vtrace_deltas + values
 
@@ -255,21 +133,9 @@ def calc_vtrace_targets(
 if __name__ == "__main__":
     HP = HyperParams()
 
-    # Create actors.
-    mp.set_start_method("spawn")
-    rollout_queue = mp.Queue(HP.rollout_queue_size)  # TODO: circular buffer?
-    stop_event = mp.Event()
-    weight_queues = [mp.Queue(1) for _ in range(HP.n_actors)]
-    actors = [
-        mp.Process(target=actor_func, args=(i, HP, rollout_queue, weight_queues[i], stop_event))
-        for i in range(HP.n_actors)
-    ]
-    for actor in actors:
-        actor.start()
-
     # Create agent.
-    envs = envpool.make_gymnasium(HP.env_name, num_envs=1)  # TODO: make this exactly like actor env?
-    agent = Agent(HP.n_frame_stack, envs.action_space.n).to(device=HP.device)
+    envs = envpool.make_gymnasium(DistSettings.ENV_NAME, num_envs=1)  # TODO: make this exactly like actor env?
+    agent = Agent(DistSettings.N_FRAME_STACK, envs.action_space.n).to(device=HP.device)
     optim = Adam(agent.parameters(), lr=HP.lr, betas=(HP.adam_beta1, HP.adam_beta2), fused=True)
     policy_version = -1
 
@@ -311,9 +177,4 @@ if __name__ == "__main__":
     # Cleanup.
     envs.close()
     log.close()
-    stop_event.set()
-    print("STOP issued, waiting for actors to terminate.")
-    for actor in actors:
-        actor.join()
-    print("DONE waiting for actors to terminate.")
     print("GOODBYE from learner.")
