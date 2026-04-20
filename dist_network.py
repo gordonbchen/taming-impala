@@ -4,28 +4,26 @@ import base64
 import numpy as np
 
 
+class MessageType:
+    GET_WEIGHTS = 0
+    WEIGHTS = 1
+    ROLLOUT = 2
+
+
 HEADER_LEN = 8
 
 
 def send_msg(sock: socket.socket, msg: dict):
-    msg_bytes = serialize(msg)
+    msg_bytes = json.dumps(msg).encode("utf-8")
     header = len(msg_bytes).to_bytes(HEADER_LEN, byteorder="big", signed=False)
     sock.sendall(header + msg_bytes)
-
-
-def serialize(msg: dict) -> bytes:
-    for k, v in msg:
-        if isinstance(v, np.ndarray):
-            msg[k] = {"type": "np.ndarray", "dtype": np.dtype(v.dtype).name, "shape": list(v.shape),
-                          "data": base64.b64encode(v.tobytes())}
-    return json.dumps(msg).encode("utf-8")
 
 
 def recv_msg(sock: socket.socket):
     header = read_socket(sock, HEADER_LEN)
     msg_len = int.from_bytes(header, byteorder="big", signed=False)
     msg_bytes = read_socket(sock, msg_len)
-    return deserialize(msg_bytes)
+    return json.loads(msg_bytes.decode("utf-8"))
 
 
 def read_socket(sock: socket.socket, n_bytes: int) -> bytes:
@@ -39,9 +37,11 @@ def read_socket(sock: socket.socket, n_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
-def deserialize(msg_bytes: bytes) -> dict:
-    payload = json.loads(msg_bytes)
-    for k, v in payload:
-        if isinstance(v, dict) and v.get("type", None) == "np.ndarray":
-            payload[k] = np.frombuffer(base64.b64decode(v["data"]), dtype=v["dtype"]).reshape(v["shape"])
-    return payload
+# TODO: more efficient serialization.
+def serialize_np(arr: np.ndarray) -> dict:
+    return {"type": "np.ndarray", "dtype": np.dtype(arr.dtype).name, "shape": list(arr.shape),
+            "data": base64.b64encode(arr.tobytes()).decode("utf-8")}
+
+
+def deserialize_np(d: dict) -> np.ndarray:
+    return np.frombuffer(base64.b64decode(d["data"]), dtype=d["dtype"]).reshape(d["shape"])

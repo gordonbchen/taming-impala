@@ -1,4 +1,7 @@
+import time
 import queue
+import threading
+import socket
 from dataclasses import dataclass
 import envpool
 import torch
@@ -9,27 +12,14 @@ from torch.optim import Adam
 from torch.utils.tensorboard import SummaryWriter
 from agent import Agent
 from cli_params import CLIParams
+from dist_network import recv_msg, send_msg, serialize_np, deserialize_np, MessageType
+from dist_settings import DistSettings
 
 torch.set_float32_matmul_precision("high")
 
 
-class DistSettings:
-    # Network.
-    HOST = "127.0.0.1"
-    PORT = 6767
-
-    # Env.
-    ENV_NAME = "Pong-v5"
-    N_FRAME_STACK = 4
-    OBS_SHAPE = (N_FRAME_STACK, 84, 84)
-    
-    ROLLOUT_STEPS = 32
-
-
 @dataclass
 class HyperParams(CLIParams):
-    max_policy_lag: int = 8
-
     # Optim.
     lr: float = 1e-3
     adam_beta1: float = 0.1
@@ -38,7 +28,8 @@ class HyperParams(CLIParams):
     # Training.
     train_steps: int = 5_000_000
     update_steps: int = 2
-    batch_rollouts: int = 1
+    batch_rollouts: int = 16
+    max_policy_lag: int = 8
 
     # Impala.
     discount_gamma: float = 0.99
@@ -53,7 +44,40 @@ class HyperParams(CLIParams):
     output_dir: str = "runs/test"
 
 
-def receive_rollouts(rollout_queue: mp.Queue, policy_version: int, HP: HyperParams):
+latest_weights = None
+policy_version = -1
+latest_weights_lock = threading.Lock()
+
+
+def conn_handler(host: str, port: int, rollout_queue: queue.Queue):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind((host, port))
+    sock.listen()
+    while True:
+        conn, addr = sock.accept()
+        thread = threading.Thread(target=actor_handler, args=(conn, addr, rollout_queue), daemon=True)
+        thread.start()
+
+
+def actor_handler(conn: socket.socket, addr, rollout_queue: queue.Queue):
+    print(f"CONNECTED to actor: {addr}.")
+    while True:
+        msg = recv_msg(conn)
+        if msg["type"] == MessageType.GET_WEIGHTS:
+            while policy_version == -1:
+                time.sleep(0.1)
+            with latest_weights_lock:
+                send_msg(conn, {"type": MessageType.WEIGHTS, "policy_version": policy_version, "state_dict": latest_weights})
+        elif msg["type"] == MessageType.ROLLOUT:
+            del msg["type"]
+            for k in ("obss", "dones", "actions", "rewards", "old_log_probs"):
+                msg[k] = deserialize_np(msg[k])
+            rollout_queue.put(msg)
+        else:
+            raise ValueError(f"Unknown message type: {msg["type"]}.")
+
+
+def get_rollouts(rollout_queue: queue.Queue, policy_version: int, HP: HyperParams):
     batches = None
     n_batches = 0
     stale_rollouts = 0
@@ -133,22 +157,23 @@ def calc_vtrace_targets(
 if __name__ == "__main__":
     HP = HyperParams()
 
-    # Create agent.
+    rollout_queue = queue.Queue(maxsize=32)
+    conn_thread = threading.Thread(target=conn_handler, args=(DistSettings.HOST, DistSettings.PORT, rollout_queue))
+    conn_thread.start()
+
     envs = envpool.make_gymnasium(DistSettings.ENV_NAME, num_envs=1)  # TODO: make this exactly like actor env?
     agent = Agent(DistSettings.N_FRAME_STACK, envs.action_space.n).to(device=HP.device)
     optim = Adam(agent.parameters(), lr=HP.lr, betas=(HP.adam_beta1, HP.adam_beta2), fused=True)
-    policy_version = -1
 
     log = SummaryWriter(log_dir=HP.output_dir)
     global_step = 0
     while global_step < HP.train_steps:
-        policy_version += 1
-        new_weights = (policy_version, {k: v.detach().cpu() for k, v in agent.state_dict().items()})
-        for weight_queue in weight_queues:
-            push_replace_queue(new_weights, weight_queue)
+        with latest_weights_lock:
+            policy_version += 1
+            latest_weights = {k: serialize_np(v.detach().cpu().numpy()) for k, v in agent.state_dict().items()}
 
         (actor_policy_version, mean_reward, n_episodes, obss, dones,
-         actions, rewards, old_log_probs, stale_rollouts) = receive_rollouts(rollout_queue, policy_version, HP)
+         actions, rewards, old_log_probs, stale_rollouts) = get_rollouts(rollout_queue, policy_version, HP)
         if n_episodes > 0:
             log.add_scalar("ep_stats/reward", mean_reward, global_step)
         log.add_scalar("ep_stats/episodes", n_episodes, global_step)
