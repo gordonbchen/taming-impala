@@ -28,7 +28,7 @@ class HyperParams(CLIParams):
     # Training.
     train_steps: int = 5_000_000
     update_steps: int = 2
-    batch_rollouts: int = 16
+    batch_rollouts: int = 1
     max_policy_lag: int = 8
 
     # Impala.
