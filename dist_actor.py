@@ -80,7 +80,7 @@ if __name__ == "__main__":
             time.sleep(0.1)
 
     # Create envs.
-    envs = envpool.make_gymnasium(DistSettings.ENV_NAME, num_envs=N_ENVS)
+    envs = envpool.make_gymnasium(DistSettings.ENV_NAME, num_envs=N_ENVS, stack_num=DistSettings.N_FRAME_STACK)
     envs = EnvPoolEpisodeStats(envs, n_envs=N_ENVS)
 
     # Create agent.

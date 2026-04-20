@@ -174,7 +174,7 @@ if __name__ == "__main__":
     conn_thread = threading.Thread(target=conn_handler, args=(DistSettings.LISTEN_HOST, DistSettings.PORT, rollout_queue), daemon=True)
     conn_thread.start()
 
-    envs = envpool.make_gymnasium(DistSettings.ENV_NAME, num_envs=1)  # TODO: make this exactly like actor env?
+    envs = envpool.make_gymnasium(DistSettings.ENV_NAME, num_envs=1, stack_num=DistSettings.N_FRAME_STACK)  # TODO: make this exactly like actor env?
     agent = Agent(DistSettings.N_FRAME_STACK, envs.action_space.n).to(device=HP.device)
     optim = Adam(agent.parameters(), lr=HP.lr, betas=(HP.adam_beta1, HP.adam_beta2), fused=True)
 
