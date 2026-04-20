@@ -22,7 +22,7 @@ def get_weights(sock: socket.socket, agent: Agent, actor_policy_version: int) ->
     if msg["policy_version"] == actor_policy_version:
         return actor_policy_version
 
-    state_dict = {k: torch.from_numpy(deserialize_np(v)) for k, v in msg["state_dict"].items()}
+    state_dict = {k: torch.tensor(deserialize_np(v)) for k, v in msg["state_dict"].items()}
     agent.load_state_dict(state_dict)
     agent.eval()
     return msg["policy_version"]
