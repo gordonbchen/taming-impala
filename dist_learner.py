@@ -64,7 +64,7 @@ def actor_handler(conn: socket.socket, addr, rollout_queue: queue.Queue):
     print(f"CONNECTED to actor: {addr}.")
     try:
         while True:
-            msg = recv_msg(conn)
+            msg, _ = recv_msg(conn)
             if msg["type"] == MessageType.GET_WEIGHTS:
                 while policy_version == -1:
                     time.sleep(0.1)
@@ -178,28 +178,32 @@ if __name__ == "__main__":
     log = SummaryWriter(log_dir=HP.output_dir)
     global_step = 0
     while global_step < HP.train_steps:
+        t0 = time.time()
         with latest_weights_lock:
             policy_version += 1
             latest_weights = {k: serialize_np(v.detach().cpu().numpy()) for k, v in agent.state_dict().items()}
+        t1 = time.time()
 
         (actor_policy_version, mean_reward, n_episodes, obss, dones,
          actions, rewards, old_log_probs, stale_rollouts) = get_rollouts(rollout_queue, policy_version, HP)
+        t2 = time.time()
         if n_episodes > 0:
             log.add_scalar("ep_stats/reward", mean_reward, global_step)
         log.add_scalar("ep_stats/episodes", n_episodes, global_step)
         log.add_scalar("async/policy_lag", policy_version - actor_policy_version, global_step)
         log.add_scalar("async/stale_rollouts", stale_rollouts, global_step)
         log.add_scalar("async/rollout_queue_len", rollout_queue.qsize(), global_step)
-        print(f"{global_step}: reward={mean_reward}")
 
         # Linearly decay lr to 0.
         optim.param_groups[0]["lr"] = HP.lr - HP.lr * (global_step / HP.train_steps)
 
         # Optimize.
+        t3 = time.time()
         for _ in range(HP.update_steps):
             policy_loss, critic_loss, entropy, grad_norm, mean_action_ratio = optimize_model(
                 agent, optim, obss, actions, rewards, dones, old_log_probs, HP
             )
+        t4 = time.time()
         log.add_scalar("loss/policy", policy_loss, global_step)
         log.add_scalar("loss/critic", critic_loss, global_step)
         log.add_scalar("loss/entropy", entropy, global_step)
@@ -208,6 +212,12 @@ if __name__ == "__main__":
         log.add_scalar("train/action_ratios", mean_action_ratio, global_step)
 
         global_step += actions.numel()
+
+        # Log.
+        total_time = t4 - t0
+        pcts = [dt / total_time for dt in [t1-t0, t2-t1, t4-t3]]
+        times = [f"{name} {pct*100:.1f}%" for name, pct in zip(("weight_sync", "get_rollout", "optim"), pcts)]
+        print(f"{global_step}: reward {mean_reward}  {'  '.join(times)}  freq {1.0/total_time:.2f}")
 
     # Cleanup.
     envs.close()

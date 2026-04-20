@@ -16,16 +16,16 @@ ROLLOUT_STEPS = 32
 N_ENVS = 16
 
 
-def get_weights(sock: socket.socket, agent: Agent, actor_policy_version: int) -> int:
+def get_weights(sock: socket.socket, agent: Agent, actor_policy_version: int) -> tuple[int, int]:
     send_msg(sock, {"type": MessageType.GET_WEIGHTS, "policy_version": actor_policy_version})
-    msg = recv_msg(sock)
+    msg, msg_size = recv_msg(sock)
     if msg["policy_version"] == actor_policy_version:
-        return actor_policy_version
+        return actor_policy_version, msg_size
 
     state_dict = {k: torch.tensor(deserialize_np(v)) for k, v in msg["state_dict"].items()}
     agent.load_state_dict(state_dict)
     agent.eval()
-    return msg["policy_version"]
+    return msg["policy_version"], msg_size
 
 
 @torch.no_grad()
@@ -86,7 +86,7 @@ if __name__ == "__main__":
     # Create agent.
     agent = Agent(DistSettings.N_FRAME_STACK, envs.action_space.n)
     policy_version = -1
-    policy_version = get_weights(sock, agent, policy_version)
+    policy_version, _ = get_weights(sock, agent, policy_version)
 
     # Storage buffers.
     obss = torch.zeros((ROLLOUT_STEPS+1, N_ENVS) + DistSettings.OBS_SHAPE, dtype=torch.float32)
@@ -103,30 +103,42 @@ if __name__ == "__main__":
 
     n_rollout = 0
     while True:
+        t0 = time.time()
         try:
-            policy_version = get_weights(sock, agent, policy_version)
+            policy_version, weight_msg_size = get_weights(sock, agent, policy_version)
         except ConnectionError as e:
             print(e)
             break
+        t1 = time.time()
 
         obs, done, total_reward, n_episodes = sample_trajectories(
             agent, envs, ROLLOUT_STEPS, obs, done, obss, dones, actions, rewards, old_log_probs
         )
+        t2 = time.time()
+
         rollout = {"type": MessageType.ROLLOUT, "actor_id": actor_id, "policy_version": policy_version,
                 "total_reward": total_reward, "n_episodes": n_episodes,
                 "obss": obss.to(dtype=torch.uint8).numpy(), "dones": dones.numpy(), "actions": actions,
                 "rewards": rewards, "old_log_probs": old_log_probs}
         for k in ("obss", "dones", "actions", "rewards", "old_log_probs"):
             rollout[k] = serialize_np(rollout[k])
+        t3 = time.time()
 
         try:
-            send_msg(sock, rollout)
-            msg = recv_msg(sock)
+            rollout_msg_size = send_msg(sock, rollout)
+            msg, _ = recv_msg(sock)
         except ConnectionError as e:
             break
+        t4 = time.time()
         assert msg["type"] == MessageType.ACK
         n_rollout += 1
-        print(f"Sent rollouts: {n_rollout}")
+
+        # Log.
+        total_time = t4 - t0
+        pcts = [dt / total_time for dt in [t1-t0, t2-t1, t3-t2, t4-t3]]
+        times = [f"{name} {pct*100:.1f}%" for name, pct in zip(("weight_sync", "sample", "serialize", "send_rollout"), pcts)]
+        print(f"{n_rollout}:  {'  '.join(times)}  freq {1.0/total_time:.2f}  ", end="")
+        print(f"weight_size {(weight_msg_size/10**6):.1f} MB  rollout_size {(rollout_msg_size/10**6):.1f} MB")
 
     envs.close()
     sock.close()

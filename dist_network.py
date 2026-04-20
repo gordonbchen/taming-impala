@@ -15,20 +15,23 @@ PROTOCOL_MAGIC = b"DISTRL"
 MSG_SIZE_LEN = 8
 
 
-def send_msg(sock: socket.socket, msg: dict):
+def send_msg(sock: socket.socket, msg: dict) -> int:
     msg_bytes = json.dumps(msg).encode("utf-8")
     msg_size = len(msg_bytes).to_bytes(MSG_SIZE_LEN, byteorder="big", signed=False)
-    sock.sendall(PROTOCOL_MAGIC + msg_size + msg_bytes)
+    full_msg = PROTOCOL_MAGIC + msg_size + msg_bytes
+    sock.sendall(full_msg)
+    return len(full_msg)
 
 
-def recv_msg(sock: socket.socket):
+def recv_msg(sock: socket.socket) -> tuple[dict, int]:
     magic = read_socket(sock, len(PROTOCOL_MAGIC))
     if magic != PROTOCOL_MAGIC:
         raise ConnectionError(f"Protocol magic does not match: {magic}")
     msg_size = read_socket(sock, MSG_SIZE_LEN)
     msg_size = int.from_bytes(msg_size, byteorder="big", signed=False)
     msg_bytes = read_socket(sock, msg_size)
-    return json.loads(msg_bytes.decode("utf-8"))
+    total_size = len(PROTOCOL_MAGIC) + MSG_SIZE_LEN + msg_size
+    return json.loads(msg_bytes.decode("utf-8")), total_size
 
 
 def read_socket(sock: socket.socket, n_bytes: int) -> bytes:
