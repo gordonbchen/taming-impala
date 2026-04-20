@@ -91,8 +91,11 @@ def get_rollouts(rollout_queue: queue.Queue, policy_version: int, HP: HyperParam
     batches = None
     n_batches = 0
     stale_rollouts = 0
+    rollout_queue_get_time = 0.0
     while n_batches < HP.batch_rollouts:
+        t0 = time.time()
         batch = rollout_queue.get()
+        rollout_queue_get_time += time.time() - t0
         if policy_version - batch["policy_version"] > HP.max_policy_lag:
             stale_rollouts += 1
             continue
@@ -112,7 +115,7 @@ def get_rollouts(rollout_queue: queue.Queue, policy_version: int, HP: HyperParam
         for k in ("obss", "dones", "rewards", "old_log_probs")
     ]
     actions = torch.tensor(np.concat(batches["actions"], axis=1), dtype=torch.int64, device=HP.device)
-    return actor_policy_version, mean_reward, n_episodes, obss, dones, actions, rewards, old_log_probs, stale_rollouts
+    return actor_policy_version, mean_reward, n_episodes, obss, dones, actions, rewards, old_log_probs, stale_rollouts, rollout_queue_get_time
 
 
 def optimize_model(
@@ -185,7 +188,7 @@ if __name__ == "__main__":
         t1 = time.time()
 
         (actor_policy_version, mean_reward, n_episodes, obss, dones,
-         actions, rewards, old_log_probs, stale_rollouts) = get_rollouts(rollout_queue, policy_version, HP)
+         actions, rewards, old_log_probs, stale_rollouts, rollout_queue_get_time) = get_rollouts(rollout_queue, policy_version, HP)
         t2 = time.time()
         if n_episodes > 0:
             log.add_scalar("ep_stats/reward", mean_reward, global_step)
@@ -215,8 +218,8 @@ if __name__ == "__main__":
 
         # Log.
         total_time = t4 - t0
-        pcts = [dt / total_time for dt in [t1-t0, t2-t1, t4-t3]]
-        times = [f"{name} {pct*100:.1f}%" for name, pct in zip(("weight_sync", "get_rollout", "optim"), pcts)]
+        pcts = [dt / total_time for dt in [t1-t0, rollout_queue_get_time, t2-t1-rollout_queue_get_time, t4-t3]]
+        times = [f"{name} {pct*100:.1f}%" for name, pct in zip(("weight_sync", "rollout_queue", "batch_rollout", "optim"), pcts)]
         print(f"{global_step}: reward {mean_reward}  {'  '.join(times)}  freq {1.0/total_time:.2f}")
 
     # Cleanup.
