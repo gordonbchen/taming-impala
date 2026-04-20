@@ -11,19 +11,23 @@ class MessageType:
     ACK = 3
 
 
-HEADER_LEN = 8
+PROTOCOL_MAGIC = b"DISTRL"
+MSG_SIZE_LEN = 8
 
 
 def send_msg(sock: socket.socket, msg: dict):
     msg_bytes = json.dumps(msg).encode("utf-8")
-    header = len(msg_bytes).to_bytes(HEADER_LEN, byteorder="big", signed=False)
-    sock.sendall(header + msg_bytes)
+    msg_size = len(msg_bytes).to_bytes(MSG_SIZE_LEN, byteorder="big", signed=False)
+    sock.sendall(PROTOCOL_MAGIC + msg_size + msg_bytes)
 
 
 def recv_msg(sock: socket.socket):
-    header = read_socket(sock, HEADER_LEN)
-    msg_len = int.from_bytes(header, byteorder="big", signed=False)
-    msg_bytes = read_socket(sock, msg_len)
+    magic = read_socket(sock, len(PROTOCOL_MAGIC))
+    if magic != PROTOCOL_MAGIC:
+        raise ConnectionError(f"Protocol magic does not match: {magic}")
+    msg_size = read_socket(sock, MSG_SIZE_LEN)
+    msg_size = int.from_bytes(msg_size, byteorder="big", signed=False)
+    msg_bytes = read_socket(sock, msg_size)
     return json.loads(msg_bytes.decode("utf-8"))
 
 

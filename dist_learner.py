@@ -83,6 +83,7 @@ def actor_handler(conn: socket.socket, addr, rollout_queue: queue.Queue):
                 raise ValueError(f"Unknown message type: {msg['type']}.")
     except ConnectionError:
         print(f"DISCONNECTED: {addr}")
+    finally:
         conn.close()
 
 
