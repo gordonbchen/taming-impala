@@ -168,7 +168,7 @@ if __name__ == "__main__":
     HP = HyperParams()
 
     rollout_queue = queue.Queue(maxsize=32)
-    conn_thread = threading.Thread(target=conn_handler, args=(DistSettings.HOST, DistSettings.PORT, rollout_queue), daemon=True)
+    conn_thread = threading.Thread(target=conn_handler, args=(DistSettings.LISTEN_HOST, DistSettings.PORT, rollout_queue), daemon=True)
     conn_thread.start()
 
     envs = envpool.make_gymnasium(DistSettings.ENV_NAME, num_envs=1)  # TODO: make this exactly like actor env?

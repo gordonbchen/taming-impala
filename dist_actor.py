@@ -74,7 +74,7 @@ if __name__ == "__main__":
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     while True:
         try:
-            sock.connect((DistSettings.HOST, DistSettings.PORT))
+            sock.connect((DistSettings.LEARNER_HOST, DistSettings.PORT))
             break
         except ConnectionRefusedError:
             time.sleep(0.1)

@@ -1,6 +1,7 @@
 class DistSettings:
     # Network.
-    HOST = "127.0.0.1"
+    LISTEN_HOST = "0.0.0.0"
+    LEARNER_HOST = "100.101.69.103"
     PORT = 6767
 
     # Env.
