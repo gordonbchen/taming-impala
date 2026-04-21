@@ -16,13 +16,13 @@ torch.set_float32_matmul_precision("high")
 
 @dataclass
 class HyperParams(CLIParams):
-    train_steps: int = 8_000_000
+    train_steps: int = 5_000_000
     n_rollout_steps: int = 128
-    n_envs: int = 16
-    device: str = "cuda"
+    update_steps: int = 4
 
     lr: float = 1e-3
-    update_steps: int = 4
+    adam_beta1: float = 0.1
+    adam_beta2: float = 0.5
 
     discount_gamma: float = 0.99
     impala_max_rho: float = 1.0
@@ -31,9 +31,11 @@ class HyperParams(CLIParams):
     entropy_coeff: float = 0.01
     max_grad_norm: float = 0.5
 
+    n_envs: int = 16
     n_frame_stack: int = 4
 
     output_dir: str = "runs/test"
+    device: str = "cuda"
 
 
 @torch.no_grad()
@@ -130,7 +132,7 @@ if __name__ == "__main__":
     # Create agent.
     agent = Agent(HP.n_frame_stack, envs.action_space.n).to(device=HP.device)
     agent.compile()
-    optim = Adam(agent.parameters(), lr=HP.lr, fused=True)
+    optim = Adam(agent.parameters(), lr=HP.lr, betas=(HP.adam_beta1, HP.adam_beta2), fused=True)
 
     # Storage buffers.
     OBS_SHAPE = (HP.n_frame_stack, 84, 84)
