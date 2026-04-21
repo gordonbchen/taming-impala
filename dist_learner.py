@@ -75,7 +75,8 @@ def actor_handler(conn: socket.socket, addr, rollout_queue: queue.Queue):
                         send_msg(conn, {"type": MessageType.WEIGHTS, "policy_version": policy_version, "state_dict": latest_weights})
             elif msg["type"] == MessageType.ROLLOUT:
                 del msg["type"]
-                for k in ("obss", "dones", "actions", "rewards", "old_log_probs"):
+                msg["obss"] = deserialize_np(msg["obss"], decompress=True)
+                for k in ("dones", "actions", "rewards", "old_log_probs"):
                     msg[k] = deserialize_np(msg[k])
                 rollout_queue.put(msg)
                 send_msg(conn, {"type": MessageType.ACK})

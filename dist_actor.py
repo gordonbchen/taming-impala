@@ -118,9 +118,10 @@ if __name__ == "__main__":
 
         rollout = {"type": MessageType.ROLLOUT, "actor_id": actor_id, "policy_version": policy_version,
                 "total_reward": total_reward, "n_episodes": n_episodes,
-                "obss": obss.to(dtype=torch.uint8).numpy(), "dones": dones.numpy(), "actions": actions,
+                "obss": serialize_np(obss.to(dtype=torch.uint8).numpy(), compress=True),
+                "dones": dones.numpy(), "actions": actions,
                 "rewards": rewards, "old_log_probs": old_log_probs}
-        for k in ("obss", "dones", "actions", "rewards", "old_log_probs"):
+        for k in ("dones", "actions", "rewards", "old_log_probs"):
             rollout[k] = serialize_np(rollout[k])
         t3 = time.time()
 

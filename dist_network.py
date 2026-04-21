@@ -2,6 +2,7 @@ import socket
 import json
 import base64
 import numpy as np
+import lz4.frame
 
 
 class MessageType:
@@ -46,10 +47,16 @@ def read_socket(sock: socket.socket, n_bytes: int) -> bytes:
 
 
 # TODO: more efficient serialization.
-def serialize_np(arr: np.ndarray) -> dict:
+def serialize_np(arr: np.ndarray, compress: bool = False) -> dict:
+    arr_bytes = arr.tobytes()
+    if compress:
+        arr_bytes = lz4.frame.compress(arr_bytes)
     return {"type": "np.ndarray", "dtype": np.dtype(arr.dtype).name, "shape": list(arr.shape),
-            "data": base64.b64encode(arr.tobytes()).decode("utf-8")}
+            "data": base64.b64encode(arr_bytes).decode("utf-8")}
 
 
-def deserialize_np(d: dict) -> np.ndarray:
-    return np.frombuffer(base64.b64decode(d["data"]), dtype=d["dtype"]).reshape(d["shape"])
+def deserialize_np(d: dict, decompress: bool = False) -> np.ndarray:
+    arr_bytes = base64.b64decode(d["data"])
+    if decompress:
+        arr_bytes = lz4.frame.decompress(arr_bytes)
+    return np.frombuffer(arr_bytes, dtype=d["dtype"]).reshape(d["shape"])
