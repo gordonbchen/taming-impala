@@ -22,7 +22,6 @@ MSG_LEN_SIZE = 8
 POLICY_VERSION_SIZE = 8
 
 
-
 class ByteReader:
     def __init__(self, data: bytes):
         self.data = memoryview(data)
