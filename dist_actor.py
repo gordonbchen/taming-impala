@@ -7,6 +7,7 @@ import numpy as np
 from torch import Tensor
 from torch.distributions import Categorical
 from agent import Agent
+from dist_log import DistLog
 from env import EnvPoolEpisodeStats
 from dist_network import send_msg, recv_msg, serialize_np, deserialize_np, MessageType
 from dist_settings import DistSettings
@@ -102,19 +103,20 @@ if __name__ == "__main__":
     done = torch.zeros(N_ENVS, dtype=torch.float32)
 
     n_rollout = 0
+    log = DistLog()
     while True:
-        t0 = time.time()
+        t0 = time.perf_counter()
         try:
             policy_version, weight_msg_size = get_weights(sock, agent, policy_version)
         except ConnectionError as e:
             print(e)
             break
-        t1 = time.time()
+        t1 = time.perf_counter()
 
         obs, done, total_reward, n_episodes = sample_trajectories(
             agent, envs, ROLLOUT_STEPS, obs, done, obss, dones, actions, rewards, old_log_probs
         )
-        t2 = time.time()
+        t2 = time.perf_counter()
 
         rollout = {"type": MessageType.ROLLOUT, "actor_id": actor_id, "policy_version": policy_version,
                 "total_reward": total_reward, "n_episodes": n_episodes,
@@ -123,23 +125,27 @@ if __name__ == "__main__":
                 "rewards": rewards, "old_log_probs": old_log_probs}
         for k in ("dones", "actions", "rewards", "old_log_probs"):
             rollout[k] = serialize_np(rollout[k])
-        t3 = time.time()
+        t3 = time.perf_counter()
 
         try:
             rollout_msg_size = send_msg(sock, rollout)
             msg, _ = recv_msg(sock)
         except ConnectionError as e:
             break
-        t4 = time.time()
+        t4 = time.perf_counter()
         assert msg["type"] == MessageType.ACK
         n_rollout += 1
 
         # Log.
         total_time = t4 - t0
-        pcts = [dt / total_time for dt in [t1-t0, t2-t1, t3-t2, t4-t3]]
-        times = [f"{name} {pct*100:.1f}%" for name, pct in zip(("weight_sync", "sample", "serialize", "send_rollout"), pcts)]
-        print(f"{n_rollout}:  {'  '.join(times)}  freq {1.0/total_time:.2f}  ", end="")
-        print(f"weight_size {(weight_msg_size/10**6):.1f} MB  rollout_size {(rollout_msg_size/10**6):.1f} MB")
+        times = "  ".join([
+            log.pct("wgt_sync", (t1 - t0) / total_time),
+            log.pct("sample", (t2 - t1) / total_time),
+            log.pct("prep_roll", (t3 - t2) / total_time),
+            log.pct("send_roll", (t4 - t3) / total_time),
+        ])
+        print(f"{n_rollout}:  {times}  {log.scalar('freq', 1.0 / total_time)}  ", end="")
+        print(f"{log.kb('wgt_sz', weight_msg_size)}  {log.kb('roll_sz', rollout_msg_size)}")
 
     envs.close()
     sock.close()

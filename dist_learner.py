@@ -12,6 +12,7 @@ from torch.optim import Adam
 from torch.utils.tensorboard import SummaryWriter
 from agent import Agent
 from cli_params import CLIParams
+from dist_log import DistLog
 from dist_network import recv_msg, send_msg, serialize_np, deserialize_np, MessageType
 from dist_settings import DistSettings
 
@@ -94,9 +95,9 @@ def get_rollouts(rollout_queue: queue.Queue, policy_version: int, HP: HyperParam
     stale_rollouts = 0
     rollout_queue_get_time = 0.0
     while n_batches < HP.batch_rollouts:
-        t0 = time.time()
+        t0 = time.perf_counter()
         batch = rollout_queue.get()
-        rollout_queue_get_time += time.time() - t0
+        rollout_queue_get_time += time.perf_counter() - t0
         if policy_version - batch["policy_version"] > HP.max_policy_lag:
             stale_rollouts += 1
             continue
@@ -180,17 +181,18 @@ if __name__ == "__main__":
     optim = Adam(agent.parameters(), lr=HP.lr, betas=(HP.adam_beta1, HP.adam_beta2), fused=True)
 
     log = SummaryWriter(log_dir=HP.output_dir)
+    console_log = DistLog()
     global_step = 0
     while global_step < HP.train_steps:
-        t0 = time.time()
+        t0 = time.perf_counter()
         with latest_weights_lock:
             policy_version += 1
             latest_weights = {k: serialize_np(v.detach().cpu().numpy()) for k, v in agent.state_dict().items()}
-        t1 = time.time()
+        t1 = time.perf_counter()
 
         (actor_policy_version, mean_reward, n_episodes, obss, dones,
          actions, rewards, old_log_probs, stale_rollouts, rollout_queue_get_time) = get_rollouts(rollout_queue, policy_version, HP)
-        t2 = time.time()
+        t2 = time.perf_counter()
         if n_episodes > 0:
             log.add_scalar("ep_stats/reward", mean_reward, global_step)
         log.add_scalar("ep_stats/episodes", n_episodes, global_step)
@@ -202,12 +204,12 @@ if __name__ == "__main__":
         optim.param_groups[0]["lr"] = HP.lr - HP.lr * (global_step / HP.train_steps)
 
         # Optimize.
-        t3 = time.time()
+        t3 = time.perf_counter()
         for _ in range(HP.update_steps):
             policy_loss, critic_loss, entropy, grad_norm, mean_action_ratio = optimize_model(
                 agent, optim, obss, actions, rewards, dones, old_log_probs, HP
             )
-        t4 = time.time()
+        t4 = time.perf_counter()
         log.add_scalar("loss/policy", policy_loss, global_step)
         log.add_scalar("loss/critic", critic_loss, global_step)
         log.add_scalar("loss/entropy", entropy, global_step)
@@ -219,9 +221,14 @@ if __name__ == "__main__":
 
         # Log.
         total_time = t4 - t0
-        pcts = [dt / total_time for dt in [t1-t0, rollout_queue_get_time, t2-t1-rollout_queue_get_time, t4-t3]]
-        times = [f"{name} {pct*100:.1f}%" for name, pct in zip(("weight_sync", "rollout_queue", "batch_rollout", "optim"), pcts)]
-        print(f"{global_step}: reward {mean_reward}  {'  '.join(times)}  freq {1.0/total_time:.2f}")
+        times = "  ".join([
+            console_log.pct("wgt_sync", (t1 - t0) / total_time),
+            console_log.pct("roll_q", rollout_queue_get_time / total_time),
+            console_log.pct("prep_batch", (t2 - t1 - rollout_queue_get_time) / total_time),
+            console_log.pct("optim", (t4 - t3) / total_time),
+        ])
+        reward_text = f"reward {mean_reward:7.2f}" if mean_reward is not None else " " * len("reward    0.00")
+        print(f"{global_step}: {reward_text}  {times}  {console_log.scalar('freq', 1.0 / total_time)}")
 
     # Cleanup.
     envs.close()
