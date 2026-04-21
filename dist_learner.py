@@ -13,7 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 from agent import Agent
 from cli_params import CLIParams
 from dist_log import DistLog
-from dist_network import recv_msg, send_msg, serialize_np, deserialize_np, MessageType
+from dist_network import recv_msg, send_msg, MessageType
 from dist_settings import DistSettings
 
 torch.set_float32_matmul_precision("high")
@@ -75,10 +75,7 @@ def actor_handler(conn: socket.socket, addr, rollout_queue: queue.Queue):
                     with latest_weights_lock:
                         send_msg(conn, {"type": MessageType.WEIGHTS, "policy_version": policy_version, "state_dict": latest_weights})
             elif msg["type"] == MessageType.ROLLOUT:
-                del msg["type"]
-                msg["obss"] = deserialize_np(msg["obss"], decompress=True)
-                for k in ("dones", "actions", "rewards", "old_log_probs"):
-                    msg[k] = deserialize_np(msg[k])
+                msg.pop("type")
                 rollout_queue.put(msg)
                 send_msg(conn, {"type": MessageType.ACK})
             else:
@@ -187,7 +184,7 @@ if __name__ == "__main__":
         t0 = time.perf_counter()
         with latest_weights_lock:
             policy_version += 1
-            latest_weights = {k: serialize_np(v.detach().cpu().numpy()) for k, v in agent.state_dict().items()}
+            latest_weights = {k: v.detach().cpu().numpy() for k, v in agent.state_dict().items()}
         t1 = time.perf_counter()
 
         (actor_policy_version, mean_reward, n_episodes, obss, dones,

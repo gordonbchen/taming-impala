@@ -9,7 +9,7 @@ from torch.distributions import Categorical
 from agent import Agent
 from dist_log import DistLog
 from env import EnvPoolEpisodeStats
-from dist_network import send_msg, recv_msg, serialize_np, deserialize_np, MessageType
+from dist_network import send_msg, recv_msg, MessageType
 from dist_settings import DistSettings
 
 
@@ -23,7 +23,7 @@ def get_weights(sock: socket.socket, agent: Agent, actor_policy_version: int) ->
     if msg["policy_version"] == actor_policy_version:
         return actor_policy_version, msg_size
 
-    state_dict = {k: torch.tensor(deserialize_np(v)) for k, v in msg["state_dict"].items()}
+    state_dict = {k: torch.tensor(v) for k, v in msg["state_dict"].items()}
     agent.load_state_dict(state_dict)
     agent.eval()
     return msg["policy_version"], msg_size
@@ -108,8 +108,8 @@ if __name__ == "__main__":
         t0 = time.perf_counter()
         try:
             policy_version, weight_msg_size = get_weights(sock, agent, policy_version)
-        except ConnectionError as e:
-            print(e)
+        except ConnectionError as exc:
+            print(exc)
             break
         t1 = time.perf_counter()
 
@@ -120,17 +120,15 @@ if __name__ == "__main__":
 
         rollout = {"type": MessageType.ROLLOUT, "actor_id": actor_id, "policy_version": policy_version,
                 "total_reward": total_reward, "n_episodes": n_episodes,
-                "obss": serialize_np(obss.to(dtype=torch.uint8).numpy(), compress=True),
+                "obss": obss.to(dtype=torch.uint8).numpy(),
                 "dones": dones.numpy(), "actions": actions,
                 "rewards": rewards, "old_log_probs": old_log_probs}
-        for k in ("dones", "actions", "rewards", "old_log_probs"):
-            rollout[k] = serialize_np(rollout[k])
         t3 = time.perf_counter()
 
         try:
             rollout_msg_size = send_msg(sock, rollout)
             msg, _ = recv_msg(sock)
-        except ConnectionError as e:
+        except ConnectionError:
             break
         t4 = time.perf_counter()
         assert msg["type"] == MessageType.ACK
