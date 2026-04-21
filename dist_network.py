@@ -12,9 +12,15 @@ class MessageType:
 
 
 PROTOCOL_MAGIC = b"DISTRL"
-MSG_SIZE_LEN = 8
-FLAG_COMPRESSED = 1
 ROLLOUT_ARRAY_KEYS = ("obss", "dones", "actions", "rewards", "old_log_probs")
+COMPRESSED_FLAG = 1
+
+PROTOCOL_MAGIC_SIZE = len(PROTOCOL_MAGIC)
+MESSAGE_TYPE_SIZE = 1
+FLAGS_SIZE = 1
+MSG_LEN_SIZE = 8
+POLICY_VERSION_SIZE = 8
+
 
 
 class ByteReader:
@@ -43,65 +49,63 @@ def send_msg(sock: socket.socket, msg: dict) -> int:
     return len(msg_bytes)
 
 
-def recv_msg(sock: socket.socket) -> tuple[dict, int]:
-    magic = read_socket(sock, len(PROTOCOL_MAGIC))
-    if magic != PROTOCOL_MAGIC:
-        raise ConnectionError(f"Protocol magic does not match: {magic}")
-
-    msg_type = read_socket(sock, 1)[0]
-    total_size = len(PROTOCOL_MAGIC) + 1
-    if msg_type == MessageType.GET_WEIGHTS:
-        policy_version = struct.unpack("!q", read_socket(sock, 8))[0]
-        return {"type": msg_type, "policy_version": policy_version}, total_size + 8
-    if msg_type == MessageType.ACK:
-        return {"type": msg_type}, total_size
-
-    flags = read_socket(sock, 1)[0]
-    payload_size = int.from_bytes(read_socket(sock, MSG_SIZE_LEN), byteorder="big", signed=False)
-    payload = read_socket(sock, payload_size)
-    total_size += 1 + MSG_SIZE_LEN + payload_size
-    if flags & FLAG_COMPRESSED:
-        payload = lz4.frame.decompress(payload)
-    return decode_payload(msg_type, payload), total_size
-
-
 def encode_msg(msg: dict) -> bytes:
-    msg_type = msg["type"]
     header = bytearray(PROTOCOL_MAGIC)
-    header.append(msg_type)
-    if msg_type == MessageType.GET_WEIGHTS:
+    header.extend(struct.pack("!b", msg["type"]))
+    if msg["type"] == MessageType.GET_WEIGHTS:
         header.extend(struct.pack("!q", msg["policy_version"]))
         return bytes(header)
-    if msg_type == MessageType.ACK:
+    if msg["type"] == MessageType.ACK:
         return bytes(header)
-    payload = encode_payload(msg_type, msg)
+    
+    payload = bytearray()
+    if msg["type"] == MessageType.WEIGHTS:
+        state_dict = {} if msg.get("state_dict") is None else msg["state_dict"]
+        payload.extend(struct.pack("!qI", msg["policy_version"], len(state_dict)))
+        for name, arr in state_dict.items():
+            append_str(payload, name)
+            append_array(payload, arr)
+    elif msg["type"] == MessageType.ROLLOUT:
+        append_str(payload, msg["actor_id"])
+        payload.extend(struct.pack("!qdI", msg["policy_version"], msg["total_reward"], msg["n_episodes"]))
+        for key in ROLLOUT_ARRAY_KEYS:
+            append_array(payload, msg[key])
+    else:
+        raise ValueError(f"Unknown message type: {msg['type']}.")
 
+    payload = bytes(payload)
     compressed = lz4.frame.compress(payload)
     flags = 0
     if len(compressed) < len(payload):
         payload = compressed
-        flags = FLAG_COMPRESSED
-    header.append(flags)
-    header.extend(len(payload).to_bytes(MSG_SIZE_LEN, byteorder="big", signed=False))
+        flags = COMPRESSED_FLAG
+    header.extend(struct.pack("!b", flags))
+    header.extend(struct.pack("!q", len(payload)))
     return bytes(header) + payload
 
 
-def encode_payload(msg_type: int, msg: dict) -> bytes:
-    out = bytearray()
-    if msg_type == MessageType.WEIGHTS:
-        state_dict = {} if msg.get("state_dict") is None else msg["state_dict"]
-        out.extend(struct.pack("!qI", msg["policy_version"], len(state_dict)))
-        for name, arr in state_dict.items():
-            append_str(out, name)
-            append_array(out, arr)
-        return bytes(out)
-    if msg_type == MessageType.ROLLOUT:
-        append_str(out, msg["actor_id"])
-        out.extend(struct.pack("!qdI", msg["policy_version"], msg["total_reward"], msg["n_episodes"]))
-        for key in ROLLOUT_ARRAY_KEYS:
-            append_array(out, msg[key])
-        return bytes(out)
-    raise ValueError(f"Unknown message type: {msg_type}.")
+def recv_msg(sock: socket.socket) -> tuple[dict, int]:
+    magic = read_socket(sock, PROTOCOL_MAGIC_SIZE)
+    if magic != PROTOCOL_MAGIC:
+        raise ConnectionError(f"Protocol magic does not match: {magic}")
+
+    msg_type, = struct.unpack("!b", read_socket(sock, MESSAGE_TYPE_SIZE))
+    msg_size = PROTOCOL_MAGIC_SIZE + MESSAGE_TYPE_SIZE
+
+    if msg_type == MessageType.GET_WEIGHTS:
+        policy_version, = struct.unpack("!q", read_socket(sock, POLICY_VERSION_SIZE))
+        return {"type": msg_type, "policy_version": policy_version}, msg_size + POLICY_VERSION_SIZE
+    if msg_type == MessageType.ACK:
+        return {"type": msg_type}, msg_size
+
+    flags, = struct.unpack("!b", read_socket(sock, FLAGS_SIZE))
+    payload_size, = struct.unpack("!q", read_socket(sock, MSG_LEN_SIZE))
+    payload = read_socket(sock, payload_size)
+    if flags & COMPRESSED_FLAG:
+        payload = lz4.frame.decompress(payload)
+
+    msg_size += FLAGS_SIZE + MSG_LEN_SIZE + payload_size
+    return decode_payload(msg_type, payload), msg_size
 
 
 def decode_payload(msg_type: int, payload: bytes) -> dict:
