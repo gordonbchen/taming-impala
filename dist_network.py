@@ -12,7 +12,7 @@ class MessageType:
 
 
 PROTOCOL_MAGIC = b"DISTRL"
-ROLLOUT_ARRAY_KEYS = ("obss", "dones", "actions", "rewards", "old_log_probs")
+ROLLOUT_ARRAY_KEYS = ("obss", "reset_prefixes", "dones", "actions", "rewards", "old_log_probs")
 COMPRESSED_FLAG = 1
 
 PROTOCOL_MAGIC_SIZE = len(PROTOCOL_MAGIC)

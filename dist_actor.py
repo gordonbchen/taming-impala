@@ -118,10 +118,14 @@ if __name__ == "__main__":
         )
         t2 = time.perf_counter()
 
+        np_obss = obss.to(dtype=torch.uint8).numpy()
+        done_mask = dones[1:].numpy().astype(bool)
+        reset_prefixes = np.zeros_like(np_obss[1:, :, :-1])
+        reset_prefixes[done_mask] = np_obss[1:, :, :-1][done_mask]
         rollout = {"type": MessageType.ROLLOUT, "actor_id": actor_id, "policy_version": policy_version,
                 "total_reward": total_reward, "n_episodes": n_episodes,
-                "obss": obss.to(dtype=torch.uint8).numpy(),
-                "dones": dones.numpy(), "actions": actions,
+                "obss": np.concat((np.moveaxis(np_obss[0], 1, 0), np_obss[1:, :, -1]), axis=0),
+                "reset_prefixes": reset_prefixes, "dones": dones.bool().numpy(), "actions": actions,
                 "rewards": rewards, "old_log_probs": old_log_probs}
         t3 = time.perf_counter()
 

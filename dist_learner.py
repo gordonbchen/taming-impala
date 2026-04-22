@@ -109,11 +109,21 @@ def get_rollouts(rollout_queue: queue.Queue, policy_version: int, HP: HyperParam
     n_episodes = n_episodes.sum()
     mean_reward = None if n_episodes == 0 else total_reward.sum() / n_episodes
 
-    obss, dones, rewards, old_log_probs = [
-        torch.tensor(np.concat(batches[k], axis=1), dtype=torch.float32, device=HP.device)
-        for k in ("obss", "dones", "rewards", "old_log_probs")
+    packed_obss, reset_prefixes, dones, actions, rewards, old_log_probs = [
+        torch.tensor(np.concat(batches[k], axis=1), dtype=dtype, device=HP.device)
+        for k, dtype in (("obss", torch.float32), ("reset_prefixes", torch.float32), ("dones", torch.bool),
+                         ("actions", torch.int64), ("rewards", torch.float32), ("old_log_probs", torch.float32))
     ]
-    actions = torch.tensor(np.concat(batches["actions"], axis=1), dtype=torch.int64, device=HP.device)
+    latest_frames = packed_obss[DistSettings.N_FRAME_STACK:]
+    obss = torch.empty((latest_frames.shape[0] + 1, packed_obss.shape[1], DistSettings.N_FRAME_STACK, *packed_obss.shape[2:]),
+                       dtype=packed_obss.dtype, device=packed_obss.device)
+    obss[0] = packed_obss[:DistSettings.N_FRAME_STACK].permute(1, 0, 2, 3)
+    for t in range(latest_frames.shape[0]):
+        obss[t+1, :, :-1] = obss[t, :, 1:]
+        obss[t+1, :, -1] = latest_frames[t]
+        done_mask = dones[t+1]
+        obss[t+1, done_mask, :-1] = reset_prefixes[t, done_mask]
+    dones = dones.to(dtype=torch.float32)
     return actor_policy_version, mean_reward, n_episodes, obss, dones, actions, rewards, old_log_probs, stale_rollouts, rollout_queue_get_time
 
 
@@ -122,8 +132,8 @@ def optimize_model(
     ) -> tuple[float, float, float, float, float]:
     # import matplotlib.pyplot as plt
     # for t in range(obss.shape[0]):
-    #     fig, axs = plt.subplots(ncols=HP.n_frame_stack)
-    #     for f in range(HP.n_frame_stack):
+    #     _, axs = plt.subplots(ncols=DistSettings.N_FRAME_STACK)
+    #     for f in range(DistSettings.N_FRAME_STACK):
     #         axs[f].imshow(obss.cpu().numpy()[t, 0, f], cmap="gray")
     #     plt.show()
     logits, values = agent(obss.reshape(-1, *obss.shape[2:]))
