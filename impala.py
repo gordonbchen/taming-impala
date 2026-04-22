@@ -17,12 +17,12 @@ torch.set_float32_matmul_precision("high")
 @dataclass
 class HyperParams(CLIParams):
     train_steps: int = 5_000_000
-    n_rollout_steps: int = 128
+    n_rollout_steps: int = 64
     update_steps: int = 4
 
-    lr: float = 1e-3
-    adam_beta1: float = 0.1
-    adam_beta2: float = 0.5
+    lr: float = 1.8e-3
+    adam_beta1: float = 0.25
+    adam_beta2: float = 0.8
 
     discount_gamma: float = 0.99
     impala_max_rho: float = 1.0
@@ -31,7 +31,7 @@ class HyperParams(CLIParams):
     entropy_coeff: float = 0.01
     max_grad_norm: float = 0.5
 
-    n_envs: int = 16
+    n_envs: int = 24
     n_frame_stack: int = 4
 
     output_dir: str = "runs/test"
