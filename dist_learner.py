@@ -109,22 +109,48 @@ def get_rollouts(rollout_queue: queue.Queue, policy_version: int, HP: HyperParam
     n_episodes = n_episodes.sum()
     mean_reward = None if n_episodes == 0 else total_reward.sum() / n_episodes
 
-    packed_obss, reset_prefixes, dones, actions, rewards, old_log_probs = [
+    obss_batches = []
+    dones_batches = []
+    for packed_obss, dones, reset_obss in zip(batches["obss"], batches["dones"], batches["reset_obss"]):
+        batch_obss, batch_dones = recon_obss(packed_obss, dones, reset_obss, HP.device)
+        obss_batches.append(batch_obss)
+        dones_batches.append(batch_dones)
+    obss = torch.concat(obss_batches, dim=1)
+    dones = torch.concat(dones_batches, dim=1).to(dtype=torch.float32)
+
+    actions, rewards, old_log_probs = [
         torch.tensor(np.concat(batches[k], axis=1), dtype=dtype, device=HP.device)
-        for k, dtype in (("obss", torch.float32), ("reset_prefixes", torch.float32), ("dones", torch.bool),
-                         ("actions", torch.int64), ("rewards", torch.float32), ("old_log_probs", torch.float32))
+        for k, dtype in (("actions", torch.int64), ("rewards", torch.float32), ("old_log_probs", torch.float32))
     ]
+    return actor_policy_version, mean_reward, n_episodes, obss, dones, actions, rewards, old_log_probs, stale_rollouts, rollout_queue_get_time
+
+
+def recon_obss(packed_obss: np.ndarray, dones: np.ndarray, reset_obss: np.ndarray, device: str) -> tuple[Tensor, Tensor]:
+    packed_obss = torch.tensor(packed_obss, dtype=torch.float32, device=device)
+    dones = torch.tensor(dones, dtype=torch.bool, device=device)
+    reset_obss = torch.tensor(reset_obss, dtype=torch.float32, device=device)
+
     latest_frames = packed_obss[DistSettings.N_FRAME_STACK:]
     obss = torch.empty((latest_frames.shape[0] + 1, packed_obss.shape[1], DistSettings.N_FRAME_STACK, *packed_obss.shape[2:]),
                        dtype=packed_obss.dtype, device=packed_obss.device)
     obss[0] = packed_obss[:DistSettings.N_FRAME_STACK].permute(1, 0, 2, 3)
+
+    reset_idx = 0
     for t in range(latest_frames.shape[0]):
         obss[t+1, :, :-1] = obss[t, :, 1:]
         obss[t+1, :, -1] = latest_frames[t]
-        done_mask = dones[t+1]
-        obss[t+1, done_mask, :-1] = reset_prefixes[t, done_mask]
-    dones = dones.to(dtype=torch.float32)
-    return actor_policy_version, mean_reward, n_episodes, obss, dones, actions, rewards, old_log_probs, stale_rollouts, rollout_queue_get_time
+
+        n_resets = int(dones[t+1].sum().item())
+        if n_resets == 0:
+            continue
+
+        next_reset_idx = reset_idx + n_resets
+        obss[t+1, dones[t+1]] = reset_obss[reset_idx:next_reset_idx]
+        reset_idx = next_reset_idx
+
+    if reset_idx != reset_obss.shape[0]:
+        raise ValueError(f"Reset observation count mismatch: used {reset_idx}, got {reset_obss.shape[0]}.")
+    return obss, dones
 
 
 def optimize_model(

@@ -121,12 +121,10 @@ if __name__ == "__main__":
         t2 = time.perf_counter()
 
         done_mask = dones[1:]
-        reset_prefixes = np.zeros_like(obss[1:, :, :-1])
-        reset_prefixes[done_mask] = obss[1:, :, :-1][done_mask]
         rollout = {"type": MessageType.ROLLOUT, "actor_id": actor_id, "policy_version": policy_version,
                    "total_reward": total_reward, "n_episodes": n_episodes,
                    "obss": np.concat((np.moveaxis(obss[0], 1, 0), obss[1:, :, -1]), axis=0),
-                   "reset_prefixes": reset_prefixes, "dones": dones, "actions": actions,
+                   "reset_obss": obss[1:][done_mask], "dones": dones, "actions": actions,
                    "rewards": rewards, "old_log_probs": old_log_probs}
         t3 = time.perf_counter()
 
