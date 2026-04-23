@@ -1,10 +1,10 @@
 import time
 import socket
 import uuid
+from argparse import ArgumentParser
 import envpool
 import torch
 import numpy as np
-from torch import Tensor
 from torch.distributions import Categorical
 from agent import Agent
 from dist_log import DistLog
@@ -17,13 +17,13 @@ ROLLOUT_STEPS = 32
 N_ENVS = 16
 
 
-def get_weights(sock: socket.socket, agent: Agent, actor_policy_version: int) -> tuple[int, int]:
+def get_weights(sock: socket.socket, agent: Agent, actor_policy_version: int, device: str) -> tuple[int, int]:
     send_msg(sock, {"type": MessageType.GET_WEIGHTS, "policy_version": actor_policy_version})
     msg, msg_size = recv_msg(sock)
     if msg["policy_version"] == actor_policy_version:
         return actor_policy_version, msg_size
 
-    state_dict = {k: torch.tensor(v) for k, v in msg["state_dict"].items()}
+    state_dict = {k: torch.tensor(v, device=device) for k, v in msg["state_dict"].items()}
     agent.load_state_dict(state_dict)
     agent.eval()
     return msg["policy_version"], msg_size
@@ -31,9 +31,9 @@ def get_weights(sock: socket.socket, agent: Agent, actor_policy_version: int) ->
 
 @torch.no_grad()
 def sample_trajectories(
-        agent: Agent, envs, rollout_steps: int, obs: Tensor, done: Tensor,
-        obss: Tensor, dones: Tensor, actions: np.ndarray, rewards: np.ndarray, old_log_probs: np.ndarray,
-    ) -> tuple[Tensor, Tensor, float, float]:
+        agent: Agent, envs, rollout_steps: int, obs: np.ndarray, done: np.ndarray, obss: np.ndarray,
+        dones: np.ndarray, actions: np.ndarray, rewards: np.ndarray, old_log_probs: np.ndarray, device: str,
+    ) -> tuple[np.ndarray, np.ndarray, float, float]:
     total_reward = 0.0
     n_episodes = 0
 
@@ -43,20 +43,20 @@ def sample_trajectories(
 
     for t in range(rollout_steps):
         # import matplotlib.pyplot as plt
-        # plt.imshow(obs[0][0].cpu().numpy(), cmap="gray")
+        # plt.imshow(obs[0][0], cmap="gray")
         # plt.show()
-        logits = agent.get_action_logits(obs)
+        logits = agent.get_action_logits(torch.tensor(obs, device=device))
         action_dist = Categorical(logits=logits)
         action = action_dist.sample()
+        old_log_probs[t] = action_dist.log_prob(action).cpu().numpy()
 
-        actions[t] = action.numpy()
-        old_log_probs[t] = action_dist.log_prob(action).numpy()
+        action = action.cpu().numpy()
+        actions[t] = action
 
-        obs, reward, terminated, truncated, info = envs.step(action.numpy())
+        obs, reward, terminated, truncated, info = envs.step(action)
         rewards[t] = reward
 
-        obs = torch.tensor(obs, dtype=torch.float32)
-        done = torch.tensor(terminated | truncated, dtype=torch.float32)
+        done = terminated | truncated
         obss[t+1] = obs
         dones[t+1] = done
 
@@ -68,8 +68,12 @@ def sample_trajectories(
 
 
 if __name__ == "__main__":
+    parser = ArgumentParser()
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    args = parser.parse_args()
+
     actor_id = uuid.uuid4().hex
-    print(f"HELLO from actor: {actor_id}.")
+    print(f"HELLO from actor: {actor_id}. device={args.device}")
 
     # Connect to learner.
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -85,13 +89,12 @@ if __name__ == "__main__":
     envs = EnvPoolEpisodeStats(envs, n_envs=N_ENVS)
 
     # Create agent.
-    agent = Agent(DistSettings.N_FRAME_STACK, envs.action_space.n)
-    policy_version = -1
-    policy_version, _ = get_weights(sock, agent, policy_version)
+    agent = Agent(DistSettings.N_FRAME_STACK, envs.action_space.n).to(device=args.device)
+    policy_version, _ = get_weights(sock, agent, -1, args.device)
 
     # Storage buffers.
-    obss = torch.zeros((ROLLOUT_STEPS+1, N_ENVS) + DistSettings.OBS_SHAPE, dtype=torch.float32)
-    dones = torch.zeros((ROLLOUT_STEPS+1, N_ENVS), dtype=torch.float32)
+    obss = np.zeros((ROLLOUT_STEPS+1, N_ENVS) + DistSettings.OBS_SHAPE, dtype=np.uint8)
+    dones = np.zeros((ROLLOUT_STEPS+1, N_ENVS), dtype=np.bool)
 
     actions = np.zeros((ROLLOUT_STEPS, N_ENVS), dtype=np.int64)
     rewards = np.zeros((ROLLOUT_STEPS, N_ENVS), dtype=np.float32)
@@ -99,34 +102,32 @@ if __name__ == "__main__":
 
     # Env init.
     obs, _ = envs.reset()
-    obs = torch.tensor(obs, dtype=torch.float32)
-    done = torch.zeros(N_ENVS, dtype=torch.float32)
+    done = np.zeros(N_ENVS, dtype=np.bool)
 
     n_rollout = 0
     log = DistLog()
     while True:
         t0 = time.perf_counter()
         try:
-            policy_version, weight_msg_size = get_weights(sock, agent, policy_version)
+            policy_version, weight_msg_size = get_weights(sock, agent, policy_version, args.device)
         except ConnectionError as exc:
             print(exc)
             break
         t1 = time.perf_counter()
 
         obs, done, total_reward, n_episodes = sample_trajectories(
-            agent, envs, ROLLOUT_STEPS, obs, done, obss, dones, actions, rewards, old_log_probs
+            agent, envs, ROLLOUT_STEPS, obs, done, obss, dones, actions, rewards, old_log_probs, args.device
         )
         t2 = time.perf_counter()
 
-        np_obss = obss.to(dtype=torch.uint8).numpy()
-        done_mask = dones[1:].numpy().astype(bool)
-        reset_prefixes = np.zeros_like(np_obss[1:, :, :-1])
-        reset_prefixes[done_mask] = np_obss[1:, :, :-1][done_mask]
+        done_mask = dones[1:]
+        reset_prefixes = np.zeros_like(obss[1:, :, :-1])
+        reset_prefixes[done_mask] = obss[1:, :, :-1][done_mask]
         rollout = {"type": MessageType.ROLLOUT, "actor_id": actor_id, "policy_version": policy_version,
-                "total_reward": total_reward, "n_episodes": n_episodes,
-                "obss": np.concat((np.moveaxis(np_obss[0], 1, 0), np_obss[1:, :, -1]), axis=0),
-                "reset_prefixes": reset_prefixes, "dones": dones.bool().numpy(), "actions": actions,
-                "rewards": rewards, "old_log_probs": old_log_probs}
+                   "total_reward": total_reward, "n_episodes": n_episodes,
+                   "obss": np.concat((np.moveaxis(obss[0], 1, 0), obss[1:, :, -1]), axis=0),
+                   "reset_prefixes": reset_prefixes, "dones": dones, "actions": actions,
+                   "rewards": rewards, "old_log_probs": old_log_probs}
         t3 = time.perf_counter()
 
         try:
