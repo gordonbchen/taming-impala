@@ -1,0 +1,140 @@
+\documentclass{article}
+\usepackage{nips15submit_e,times}
+\usepackage{hyperref}
+\usepackage{url}
+
+\usepackage[table]{xcolor}
+\usepackage{colortbl}
+\usepackage{graphicx}
+\usepackage{amssymb, amsmath}
+\usepackage[normalem]{ulem}
+
+
+\title{Towards Distributed, Asynchronous Reinforcement Learning on Consumer Compute}
+
+
+\author{
+Gordon Chen\\
+School of Computing\\
+University of Connecticut\\
+\texttt{gbc24001@uconn.edu}\\
+}
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+\nipsfinalcopy
+
+\begin{document}
+
+
+\maketitle
+
+\begin{abstract}
+Deep learning research increasingly depends on access to large amounts of compute. At the same time,
+due to recent interest in deep learning, compute is becoming harder to access for student researchers
+and hobbyists.
+In this paper, we develop a distributed, asynchronous reinforcement learning protocol
+that can make use of idle, heterogeneous consumer compute over the internet.
+We use IMPALA's V-Trace algorithm to correct for stale policies and show via ablations that it is
+necessary in order to make asynchronous training stable.
+We introduce trajectory compression and protocol optimizations that allow us to beat a tuned
+synchronous baseline, reaching the maximum reward on Pong faster in wall-clock time.
+We open-source our code on GitHub at \url{https://github.com/gordonbchen/taming-impala} and hope that
+this framework will allow students and researchers to do even more awesome things through
+consumer compute pooling.
+\end{abstract}
+
+
+\section{Introduction}
+Due to the increased interest in deep learning, compute for student and hobbyist research is becoming harder
+to access. Both memory and GPUs are getting more expensive, and cloud compute providers frequently run out of
+GPU instances when demand is high. Models are getting bigger and experiments are getting more expensive,
+meaning that even relatively small research projects can be constrained by access to compute.
+
+Simultaneously, a large amount of consumer compute, such as desktops and gaming PCs,
+sits around unused for most of the day. Many students and hobbyists often have desktops with decent hardware
+that spend much of the day idle. Alone, these machines are often not powerful enough
+for modern deep learning experiments, even though collectively they may represent a substantial pool
+of useful compute.
+
+We believe that reinforcement learning is very well suited for distributed asynchronous training, even
+more so that classic supervised learning. In supervised learning, data is collected beforehand and during
+training there is really only optimization. On the other hand, reinforcement learning algorithms very
+naturally split between alternating rollout and policy / value function optimization phases. RL's unique
+property that data is collected online as the model changes makes it ripe for asynchronous training, which
+increases update throughput by overlapping rollout and optimization phases at the cost of introducing
+the negative effects of stale data.
+
+In this paper, we develop a distributed, asynchronous reinforcement learning protocol that
+allows multiple geographically scattered machines to contribute compute to a shared training run
+over the internet.
+Our protocol follows the general setup from IMPALA, with actor nodes that collect trajectories using local,
+often stale, copies of the policy network, and periodically send those trajectories to a central learner
+over the internet, and receive updated model parameters in return.
+
+Building upon IMPALA, we introduce protocol optimizations such as rollout compression and a custom message
+format to reduce internet bandwidth constraints, allowing for higher update throughput. The flexible protocol we
+develop is not strongly tied to any particular neural network architecture or environment. Furthermore,
+in contrast to the within-datacenter, distributed training with homogenous compute that IMPALA was meant for,
+our protocol is developed for unreliable, bandwidth-limited setups for compute pooling over the internet, and
+thus supports actors with heterogeneous compute capabilities (CPU and GPU), as well as resilience to actors
+leaving and joining the commpute pool in the middle of a training run.
+
+We thoroughly ablate our protocol, and find that IMPALA's V-Trace is necessary to stabilize asynchronous
+training at the levels of policy lag our cross-internet protocol faces.
+
+
+\section{Background}
+In 2018, Espeholt et al. released IMPALA, an asynchronous reinforcment learning architecture that uses
+multiple actor nodes to roll out trajectories with a local, possibly stale actor and sends collected
+trajectories to a central learner, which optimizes the policy and value function, and broadcasts the updated
+model parameters to actors. Critically, the authors introduce V-Trace, an algorithm that uses importance
+sampling corrections to adapt policy gradient updates to use rollouts with stale policies. We will now derive
+V-Trace.
+
+We first start with the vanilla policy gradient
+$$
+\nabla_\theta J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}
+\left[ \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t|s_t) \ \Phi_t \right]
+$$
+
+where $J(\theta)$ is the expected, discounted cumulative reward of a parameterized policy $\pi_\theta$ in some
+Markov Decision Process. Rollout trajectories are dented $\tau$, and are made up of states $s_t$, actions $a_t$,
+and rewards $r_t$ from times $1..T$.
+
+Here, $\Phi_t$ can represent the cumulative discounted return, Rewards-To-Go, or any general advantage estimate.
+For our purposes, we choose $\Phi_t$ to be the baselined $n$-step Bellman target.
+\begin{align*}
+    \Phi_t &= v_t - V_\phi(s_t) \\
+    v_t &= \sum_{t'=t}^{T-1} \gamma^{t'-t} r_t' + \gamma^{T-t} V_\phi(s_T)
+\end{align*}
+
+Here, $v_t$ is the $n$-step Bellman target, $V_\phi$ is our parameterized value function baseline,
+and $\gamma$ is the future reward discount factor.
+
+The $n$-step Bellman target is essentially the cumulative discounted reward for $n$ steps and the bootstrapped
+discounted value of the last state. We can also write the $n$-step Bellman target in terms of TD-error $\delta_t$
+as follows:
+\begin{align*}
+    \delta_t &= r_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t) \\
+    v_t &= V_\phi(s_t) + \sum_{t'=t}^{T-1} \gamma^{t'-t} \delta_t
+\end{align*}
+
+Now we can see that the $n$-step Bellman target is the value of the current state, plus discounted TD-error
+correction factors.
+
+However, in the context of asynchronous training, we have a problem. In our equation for the $n$-step Bellman
+target, $V_\phi(s_t)$ is the expected value of the state $s_t$ if we follow the current policy, but the
+rewards and therefore TD-error correction terms are coming from rollouts that were collected on the actor,
+so from a stale policy. This mismatch means that $V_\phi(s_t)$ is supposed to be with respect to the current
+policy, but will be trained to predict the return coming from stale policies.
+
+
+
+
+
+
+% \subsubsection*{Acknowledgments}
+% \subsubsection*{References}
+\end{document}$
