@@ -207,7 +207,7 @@ each weight tensor. To serialize each tensor, we store the name of the parameter
 dimensions, the shape, and the flattened raw bytes of the tensor. To deserialize the agent's state dict, the actor
 reads the weight's name and reshapes the tensor's raw bytes.
 
-\verb|ROLLOUT| messages contain the actor's uuid to identify which actors are contributing the most rollouts,
+\verb|ROLLOUT| messages contain the actor's UUID to identify which actors are contributing the most rollouts,
 local policy version, and the rollout, which consists of observations, actions, rewards, actor policy log
 probabilities, and a done mask. The actor's local policy version is used by the learner to throw away any
 rollouts that are too stale, set again by a configurable threshold. This prevents extremely old rollout batches
@@ -280,28 +280,127 @@ distributed training, the 1.5x speed increase using our distributed training set
 throughput, overlapping rollouts on actor devices with optimization steps on the learner device and eliminating any idle waiting time
 between the two phases.
 
-\begin{figure}[ht]
+\begin{figure}[!htbp]
     \centering
     \includegraphics[width=\textwidth]{final_imgs/dist_sync_rel.png}
     \caption{Wall-clock comparison of distributed protocol (blue) vs synchronous baseline (red).}
     \label{fig:dist_sync_rel}
 \end{figure}
 
-\begin{figure}[ht]
+\begin{figure}[!htbp]
     \centering
     \includegraphics[width=\textwidth]{final_imgs/dist_sync_step.png}
     \caption{Env step comparison of distributed protocol (blue) vs synchronous baseline (red).}
     \label{fig:dist_sync_step}
 \end{figure}
 
+We also run ablations on our protocol, empirically testing which parts of V-Trace, if any, are necessary to stabilize the heavily
+asynchronous training we do when the distributed aspect of out protocol increases latency and policy lag. We try training without
+clipping the importance sampling weights, and jettisoning V-Trace importance sampling corrections entirely. Both perform noticeably
+worse compared to the distributed protocol, with no V-Trace performing worse than no-clip (Fig 3).
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=\textwidth]{final_imgs/dist_noclip_nov_reward.png}
+    \caption{Reward: Dist (blue) vs No Ratio Clip (orange) vs No V-Trace (green).}
+    \label{fig:dist_noclip_nov_reward}
+\end{figure}
+
+Looking at our logged metrics, we develop a hypothesize as to why this may be the case. During training, with the 3
+actor setup described above, the average policy lag is around 3.5, meaning that rollouts are collected, on average,
+by a local agent policy 3.5 update steps stale. This is quite a bit. When rollouts are collected by policies this stale,
+the product of action ratios over 32 steps can get quite large (Fig 4). Without clipping importance sampling weights,
+the action ratios explode and cause the value target to be very high variance, destabilizing training and creating
+requiring large updates from the value function, which must predict a widly varying target, and the policy function,
+which must adapt to maximize the wildly varying value function. This instability is reflected in the gradient norm (Fig 5)
+exploding compared to the distributed protocol which uses full V-Trace. We also hypothesize that
+no V-Trace is even worse than just no-clip because while no-clip can product high variance value targets, the value
+targets are importance sampled and therefore are, in expectation, the correct value targets for the current learner policy.
+However, not using V-Trace at all means that the value targets are based off of very stale policies and are theoretically
+unsound and extremely unhelpful and destabilizing in practice.
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=\textwidth]{final_imgs/dist_noclip_nov_ratio.png}
+    \caption{Action ratios: Dist (blue) vs No Ratio Clip (orange) vs No V-Trace (green).}
+    \label{fig:dist_noclip_nov_ratio}
+\end{figure}
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=\textwidth]{final_imgs/dist_noclip_nov_grad.png}
+    \caption{Grad Norms: Dist (blue) vs No Ratio Clip (orange) vs No V-Trace (green).}
+    \label{fig:dist_noclip_nov_grad}
+\end{figure}
 
 
 \section{Limitations and Future Work}
+Despite showing that our distributed asynchronous protocol can reach maximum reward on Pong faster than
+a tuned synchronous baseline, the wall clock gap of around 1.7 minutes is not an extremely substantial
+improvement. We see three ways to make the improvement between the distributed and synchronous protocols
+more substantial.
+
+\begin{enumerate}
+\item Heavier environments. Pong is a relatively fast environment. Each step does not take much time,
+so rolling out the environment is not really a bottleneck for RL training on Pong.
+If we used heavier environments where
+each environment step cost much more time and compute, then sampling rollouts could be a real bottleneck
+for training. Heavier environments would make it even more attractive to use asynchronous training,
+since synchronously the optimization phase would have to wait a long time for the rollout stage, but
+having multiple agents rolling out environments asyncrhonously and constantly streaming rollouts to the
+learner would allow for much higher update throughput.
+
+\item Heavier policies. This is similar to having heavier environments. When policies get larger, sequential
+sampling, which requires forwarding the model once rollout step and is what actors must do, gets much
+slower than batch evaluation, which just forwards the model a single time over the entire rollout and is
+what the learner does. This again makes rollouts the bottleneck and increases the improvement asynchronous
+training would give.
+
+\item More actor devices. We only trained with a single additional actor device, but likely could have gotten
+even better rollout and update throughput had we increase the number of actor devices. At some point though,
+the single learner having to collect and run optimizatoin on rollouts from all actors will become the
+bottleneck to more speed. Future work could try coming up with ways to scale beyond this bottleneck while
+trying to keep as much sample efficiency as possible.
+\end{enumerate}
+
+Another limitation of this work is that the synchronous baseline we compare to is not the absolute strongest
+synchronous basline we could use. In the future we would like to compare our distributed asynchronous
+protocol against PPO, the strongest synchronous baseline. Interesting future work could also try to mix
+PPO with IMPALA, using Generalized Advantage Estimation instead of an $n$-step TD-target and including
+entropy rewards.
+
+We would also like to scale our protocol beyond just a single private Tailnet and potentially develop
+a public learner service with GET weight and POST rollout endpoints so that anyone on the internet can
+contribute compute to a run. There are a couple different ways to achieve this. One option is
+where the service only accepts requests signed by a preshared key, ensuring that the nodes that join
+are trusted but also strongly limiting the scale of compute sharing. The other method would be to allow
+any nodes to join the network and contribute compute, but then there comes the problem of securing such a
+public network against malicious nodes that may spam the learner with garbage rollouts, or even more
+sinisterly, with rollouts that are slightly wrnog and destabilize training. This is a very interesting
+problem that Prime RL seems to be working on.
+
+While we only tested our protocol on Pong, we believe that distributed asynchronous RL could be very
+beneficial for reinforcement learning post-training on LLMs, since those often include long-horizon rollouts
+that make rolling out a bottleneck for training. Again, Prime RL is doing very interesting work in this area.
+
 
 \section{Conclusion}
+In this paper, we develop a protocol for asynchronous, distributed reinforcement learning on heterogenous
+consumer compute. We build off of the architecture introduced in IMPALA, and introduce compression
+techniques and protocol optimizations to make distributed training as fast as possible.
+We demonstrate its potential for speeding up RL training by beating a tuned synchronous
+baseline on Pong, and ablate it to empirically show that IMPALA's V-Trace importance sampling corrections
+are essential for training stability.
+
+We sincerely hope that the ideas from this paper can empower researchers to do more interesting experiments
+that they could not without compute pooling.
 
 
+\subsubsection*{Acknowledgments}
+This paper was written for the final project of CSE 5820: Reinforcement Learning taught in Spring 2026 at
+UConn. Thank you to Professor Shi for teaching the class, it was a pleasure learning about this incredibly
+interesting field.
 
-% \subsubsection*{Acknowledgments}
-% \subsubsection*{References}
+\subsubsection*{References}
+
 \end{document}
