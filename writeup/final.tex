@@ -1,6 +1,6 @@
 \documentclass{article}
 \usepackage{nips15submit_e,times}
-\usepackage{hyperref}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
 \usepackage{url}
 
 \usepackage[table]{xcolor}
@@ -40,9 +40,10 @@ We use IMPALA's V-Trace algorithm to correct for stale policies and show via abl
 necessary in order to make asynchronous training stable.
 We introduce trajectory compression and protocol optimizations that allow us to beat a tuned
 synchronous baseline, reaching the maximum reward on Pong faster in wall-clock time.
-We open-source our code on GitHub at \url{https://github.com/gordonbchen/taming-impala} and hope that
-this framework will allow students and researchers to do even more awesome things through
-consumer compute pooling.
+We open-source our code on GitHub at
+\href{https://github.com/gordonbchen/taming-impala}{github.com/gordonbchen/taming-impala}
+and hope that this framework will allow students and researchers to do even more awesome
+things through consumer compute pooling.
 \end{abstract}
 
 
@@ -76,22 +77,22 @@ over the internet, and receive updated model parameters in return.
 Building upon IMPALA, we introduce protocol optimizations such as rollout compression and a custom message
 format to reduce internet bandwidth constraints, allowing for higher update throughput. The flexible protocol we
 develop is not strongly tied to any particular neural network architecture or environment. Furthermore,
-in contrast to the within-datacenter, distributed training with homogenous compute that IMPALA was meant for,
+in contrast to the within-datacenter, distributed training with homogeneous compute that IMPALA was meant for,
 our protocol is developed for unreliable, bandwidth-limited setups for compute pooling over the internet, and
 thus supports actors with heterogeneous compute capabilities (CPU and GPU), as well as resilience to actors
-leaving and joining the commpute pool in the middle of a training run.
+leaving and joining the compute pool in the middle of a training run.
 
 We thoroughly ablate our protocol, and find that IMPALA's V-Trace is necessary to stabilize asynchronous
 training at the levels of policy lag our cross-internet protocol faces.
 
 
 \section{Background}
-In 2018, Espeholt et al. released IMPALA, an asynchronous reinforcment learning architecture that uses
-multiple actor nodes to roll out trajectories with a local, possibly stale actor and sends collected
-trajectories to a central learner, which optimizes the policy and value function, and broadcasts the updated
-model parameters to actors. Critically, the authors introduce V-Trace, an algorithm that uses importance
-sampling corrections to adapt policy gradient updates to use rollouts with stale policies. We will now derive
-V-Trace.
+In 2018, Espeholt et al. introduced IMPALA, an asynchronous reinforcement learning architecture that uses
+multiple actor nodes to roll out trajectories with a local, possibly stale behavior policy and sends collected
+trajectories to a central learner, which optimizes the policy and value function, and broadcasts updated
+model parameters back to actors \cite{espeholt2018impala}. Critically, the authors introduce V-trace, an
+algorithm that uses importance-sampling corrections to adapt policy-gradient updates to stale-policy
+rollouts \cite{espeholt2018impala}. We will now derive V-trace.
 
 We first start with the vanilla policy gradient
 $$
@@ -100,49 +101,47 @@ $$
 $$
 
 where $J(\theta)$ is the expected, discounted cumulative reward of a parameterized policy $\pi_\theta$ in some
-Markov Decision Process. Rollout trajectories are dented $\tau$, and are made up of states $s_t$, actions $a_t$,
+Markov Decision Process. Rollout trajectories are denoted $\tau$, and are made up of states $s_t$, actions $a_t$,
 and rewards $r_t$ from times $1..T$.
 
 Here, $\Phi_t$ can represent the cumulative discounted return, Rewards-To-Go, or any general advantage estimate.
-For our purposes, we choose $\Phi_t$ to be the baselined $n$-step Bellman target.
+For our purposes, we choose $\Phi_t$ to be the baseline-subtracted bootstrapped return.
 \begin{align*}
     \Phi_t &= v_t - V_\phi(s_t) \\
-    v_t &= \sum_{t'=t}^{T-1} \gamma^{t'-t} r_t' + \gamma^{T-t} V_\phi(s_T)
+    v_t &= \sum_{t'=t}^{T-1} \gamma^{t'-t} r_{t'} + \gamma^{T-t} V_\phi(s_T)
 \end{align*}
 
-Here, $v_t$ is the $n$-step Bellman target, $V_\phi$ is our parameterized value function baseline,
+Here, $v_t$ is the bootstrapped return, $V_\phi$ is our parameterized value-function baseline,
 and $\gamma$ is the future reward discount factor.
 
-The $n$-step Bellman target is essentially the cumulative discounted reward for $n$ steps and the bootstrapped
-discounted value of the last state. We can also write the $n$-step Bellman target in terms of TD-error $\delta_t$
+This return is essentially the cumulative discounted rewards plus the bootstrapped discounted value of the last state. Equivalently, we can rewrite this bootstrapped return in terms of TD-errors $\delta_t$
 as follows:
 \begin{align*}
     \delta_t &= r_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t) \\
-    v_t &= V_\phi(s_t) + \sum_{t'=t}^{T-1} \gamma^{t'-t} \delta_t'
+    v_t &= V_\phi(s_t) + \sum_{t'=t}^{T-1} \gamma^{t'-t} \delta_{t'}
 \end{align*}
 
-Now we can see that the $n$-step Bellman target is the value of the current state, plus discounted TD-error
-correction factors.
+Now we can see that this bootstrapped return is the value of the current state plus discounted TD-error
+correction terms.
 
-However, in the context of asynchronous training, we have a problem. In our equation for the $n$-step Bellman
-target, $V_\phi(s_t)$ is the expected value of the state $s_t$ if we follow the current policy, but the
-rewards and therefore TD-error correction terms are coming from rollouts that were collected on the actor,
-so from a stale policy. This mismatch means that $V_\phi(s_t)$ is supposed to be with respect to the current
-policy, but will be trained to predict the return coming from stale policies.
+However, in the context of asynchronous training, we have a problem. In our equation for the bootstrapped
+return, $V_\phi(s_t)$ is meant to represent the value of state $s_t$ under the current learner policy, but the
+rewards and therefore the TD-error correction terms come from trajectories collected on actors using stale
+policies. This mismatch means that $V_\phi(s_t)$ is being trained to predict returns induced by stale policies.
 
-Since we are sampling from a stale policy, the Bellman target actually estimates $v^\mu_t$, the expected
+Since we are sampling from a stale policy, this bootstrapped return actually estimates $v^\mu_t$, the expected
 cumulative discounted return if we follow a stale policy $\mu$, instead of what we want, which is $v_t$,
 the expected cumulative discounted return if we follow the learner's most updated policy $\pi$.
 \begin{align*}
-v^\mu_t &= \mathbb{E}_{\tau \sim \mu} \left[ V_\phi(s_t) + \sum_{t'=t}^{T-1} \gamma^{t'-t} \delta_t \right] \\
-v_t &= \mathbb{E}_{\tau \sim \pi} \left[ V_\phi(s_t) + \sum_{t'=t}^{T-1} \gamma^{t'-t} \delta_t \right]
+v^\mu_t &= \mathbb{E}_{\tau \sim \mu} \left[ V_\phi(s_t) + \sum_{t'=t}^{T-1} \gamma^{t'-t} \delta_{t'} \right] \\
+v_t &= \mathbb{E}_{\tau \sim \pi} \left[ V_\phi(s_t) + \sum_{t'=t}^{T-1} \gamma^{t'-t} \delta_{t'} \right]
 \end{align*}
 
 V-Trace uses importance sampling to correct the TD-error terms.
 \begin{align*}
 v_t &= \mathbb{E}_{\tau \sim \mu} \left[ V_\phi(s_t) + \sum_{t'=t}^{T-1} \gamma^{t'-t}
 \left( \prod_{i=t}^{t'} \rho_i \right)
-\delta_t \right] \\
+\delta_{t'} \right] \\
 \rho_t &= \frac{\pi(a_t|s_t)}{\mu(a_t|s_t)}
 \end{align*}
 
@@ -160,20 +159,20 @@ v_t &= V_\phi(s_t) + \sum_{t'=t}^{T-1} \gamma^{t'-t}
 \end{align*}
 
 We can now see why IMPALA sends rollouts from actors to the learner instead of gradients like A3C.
-Importance sampling requires both the log probabilities of the stale actor and the current learner. In
-A3C like asynchronous architectures, each actors does an optimization step independently, so it never
-has the log probabilities of the current learner.
+Importance sampling requires both the log probabilities of the stale actor policy and those of the current
+learner policy on the same sampled actions. In the standard IMPALA architecture, the learner can recompute
+current-policy log probabilities on the received trajectories directly. In A3C-like architectures,
+each actor performs optimization locally, so IMPALA's learner-side importance sampling correction is not possible.
 
 
 \section{Methodology}
-For all experiments, we use the Pong-v5 environment from EnvPool for gymansium-compatible parallel
-environments. We use EnvPool's default Atari wrapper parameters, including 4 frame stack, grayscale, 4 frame
-skip, and random noops at the start of each episode for stochasticity.
+For all experiments, we use the Pong-v5 environment from EnvPool for Gymnasium-compatible parallel
+environments \cite{weng2022envpool}. We use EnvPool's default Atari wrapper parameters, including 4-frame
+stack, grayscale, 4-frame skip, and random no-ops at the start of each episode for stochasticity.
 
 We use a convolutional actor-critic network as the agent. The agent has a shared feature extractor backbone
-and actor and critic heads. The design of the agent is heavily inspired by The 37 Implementation Details of
-Proximal Policy Optimization by Costa Huang Et. al
-(\url{https://iclr-blog-track.github.io/2022/03/25/ppo-implementation-details/}).
+and actor and critic heads. The design of the agent is heavily inspired by \emph{The 37 Implementation Details of Proximal Policy
+Optimization} by Huang et al. \cite{huang2022ppo37}.
 
 As a synchronous baseline, we use a single learner process with vectorized environments. In addition to the
 usual suspects of learning rate and Adam $\beta_1, \beta_2$, we tune the number of parallel environments,
@@ -239,7 +238,7 @@ that joins the training run. When actors leave the network, the learner's corres
 gracefully continues from the perspective of the learner's main optimization thread. When the device rejoins the network, the learner
 simply considers the device as a new actor and adds a handler. The separation of responsibilities between the optimization thread
 and the actor handlers on the learner allows us to have this clean fault-tolerant API that connects the optimization and actor
-handlers soley by the rollouts in the queue and the most updated learner agent weights. To handle extremely stale
+handlers solely by the rollouts in the queue and the most updated learner agent weights. To handle extremely stale
 rollouts, which can occur if some actors are very slow or the TCP message gets delayed in transit, we also introduce a configurable
 maximum policy lag hyperparameter that the learner uses to throw away potentially destabilizing rollouts. Furthermore, another
 potential problem when doing this kind of asynchronous communication is that if the learner somehow takes too long to do an update,
@@ -249,7 +248,7 @@ rollouts in the back of the queue put there long ago by the overhang of actors w
 along with the compute on the actors side it took to collect those rollouts and the compute the learner used decompressing, deserializing,
 and preparing the rollout for optimization. To alleviate this problem, learners send \verb|ACK| messages in response to collecting
 rollouts from actors. Actors can only continue sampling rollouts after a learner ACKs their last rollout, which provides some
-backpressure for actors to not compeltely saturate the learner's queue.
+backpressure for actors to not completely saturate the learner's queue.
 
 
 \section{Results}
@@ -266,14 +265,14 @@ The machine we used for experiments was simply not powerful enough to handle the
 environments in parallel. We tried decreasing the number of parallel environments running in each actor, but then the learner would
 have to wait for 2 rollout batches for the optimal rollout batch size, which negated any gains we got from rolling out in parallel.
 So for the local asynchronous baseline, we truly were compute constrained, which is exactly the situation this paper tries to address.
-If we could run more actors in parallel, increasing the rollout throughput, then we would be able to beat the syncrhonous baseline.
+If we could run more actors in parallel, increasing the rollout throughput, then we would be able to beat the synchronous baseline.
 
 For our distributed asynchronous protocol, we ran the learner and a single actor on a desktop connected it to 2 actors on a laptop
 via Tailscale. Compare this to the asynchronous baseline, where we were trying to run a learner and 2 actors on the same desktop.
-Using the distributed asynchronous protol, we were able to beat our heavily tuned synchronous baseline, reaching maximum reward on Pong
-in 3.3 minutes, compared to the synchronous baseline, which took 5.1 minutes (Fig 1). So our distributed protocol was able to beat the
-synchronous basline in terms of wall clock time. These gains came exclusively from higher rollout and update throughput. Comparing the
-the synchronous and distributed rewards by environment steps, both runs reach maximum Pong reward at around 2M environment steps (Fig 2).
+Using the distributed asynchronous protocol, we were able to beat our heavily tuned synchronous baseline, reaching maximum reward on Pong
+in 3.3 minutes, compared to the synchronous baseline, which took 5.1 minutes (Figure~\ref{fig:dist_sync_rel}). So our distributed protocol was able to beat the
+synchronous baseline in terms of wall-clock time. These gains came exclusively from higher rollout and update throughput. Comparing the
+synchronous and distributed runs by environment steps, both reach maximum Pong reward at around 2M environment steps (Figure~\ref{fig:dist_sync_step}).
 This makes a lot of sense, as the gains from distributed training do not come from increased sample efficiency. In fact, one would even
 suspsect that distributed training would be worse for sample efficiency because of the stale policy problem. Instead, the gains from
 distributed training, the 1.5x speed increase using our distributed training setup comes just from increased rollout and update
@@ -297,7 +296,7 @@ between the two phases.
 We also run ablations on our protocol, empirically testing which parts of V-Trace, if any, are necessary to stabilize the heavily
 asynchronous training we do when the distributed aspect of out protocol increases latency and policy lag. We try training without
 clipping the importance sampling weights, and jettisoning V-Trace importance sampling corrections entirely. Both perform noticeably
-worse compared to the distributed protocol, with no V-Trace performing worse than no-clip (Fig 3).
+worse compared to the distributed protocol, with no V-trace performing worse than no-clipping (Figure~\ref{fig:dist_noclip_nov_reward}).
 
 \begin{figure}[!htbp]
     \centering
@@ -309,11 +308,11 @@ worse compared to the distributed protocol, with no V-Trace performing worse tha
 Looking at our logged metrics, we develop a hypothesize as to why this may be the case. During training, with the 3
 actor setup described above, the average policy lag is around 3.5, meaning that rollouts are collected, on average,
 by a local agent policy 3.5 update steps stale. This is quite a bit. When rollouts are collected by policies this stale,
-the product of action ratios over 32 steps can get quite large (Fig 4). Without clipping importance sampling weights,
-the action ratios explode and cause the value target to be very high variance, destabilizing training and creating
-requiring large updates from the value function, which must predict a widly varying target, and the policy function,
-which must adapt to maximize the wildly varying value function. This instability is reflected in the gradient norm (Fig 5)
-exploding compared to the distributed protocol which uses full V-Trace. We also hypothesize that
+the per-step action ratios can become quite large and unstable (Figure~\ref{fig:dist_noclip_nov_ratio}). Without clipping importance-sampling weights,
+these ratios can produce very high-variance value targets, destabilizing training and
+requiring large updates from both the value function, which must predict a wildly varying target, and the policy function,
+which must adapt to maximize that unstable value estimate. This instability is reflected in the gradient norm (Figure~\ref{fig:dist_noclip_nov_grad})
+exploding compared to the distributed protocol, which uses full V-trace. We also hypothesize that
 no V-Trace is even worse than just no-clip because while no-clip can product high variance value targets, the value
 targets are importance sampled and therefore are, in expectation, the correct value targets for the current learner policy.
 However, not using V-Trace at all means that the value targets are based off of very stale policies and are theoretically
@@ -347,7 +346,7 @@ If we used heavier environments where
 each environment step cost much more time and compute, then sampling rollouts could be a real bottleneck
 for training. Heavier environments would make it even more attractive to use asynchronous training,
 since synchronously the optimization phase would have to wait a long time for the rollout stage, but
-having multiple agents rolling out environments asyncrhonously and constantly streaming rollouts to the
+having multiple agents rolling out environments asynchronously and constantly streaming rollouts to the
 learner would allow for much higher update throughput.
 
 \item Heavier policies. This is similar to having heavier environments. When policies get larger, sequential
@@ -364,10 +363,10 @@ trying to keep as much sample efficiency as possible.
 \end{enumerate}
 
 Another limitation of this work is that the synchronous baseline we compare to is not the absolute strongest
-synchronous basline we could use. In the future we would like to compare our distributed asynchronous
-protocol against PPO, the strongest synchronous baseline. Interesting future work could also try to mix
-PPO with IMPALA, using Generalized Advantage Estimation instead of an $n$-step TD-target and including
-entropy rewards.
+synchronous baseline we could use. In the future we would like to compare our distributed asynchronous
+protocol against PPO \cite{schulman2017ppo}, the strongest synchronous baseline. Interesting future work
+could also try to mix PPO with IMPALA, using Generalized Advantage Estimation \cite{schulman2015gae}
+instead of a bootstrapped return and including entropy rewards.
 
 We would also like to scale our protocol beyond just a single private Tailnet and potentially develop
 a public learner service with GET weight and POST rollout endpoints so that anyone on the internet can
@@ -376,12 +375,12 @@ where the service only accepts requests signed by a preshared key, ensuring that
 are trusted but also strongly limiting the scale of compute sharing. The other method would be to allow
 any nodes to join the network and contribute compute, but then there comes the problem of securing such a
 public network against malicious nodes that may spam the learner with garbage rollouts, or even more
-sinisterly, with rollouts that are slightly wrnog and destabilize training. This is a very interesting
-problem that Prime RL seems to be working on.
+sinisterly, with rollouts that are slightly wrong and destabilize training. This is a very interesting
+problem that recent work on distributed RL for language models has started to explore \cite{primerl2025}.
 
 While we only tested our protocol on Pong, we believe that distributed asynchronous RL could be very
 beneficial for reinforcement learning post-training on LLMs, since those often include long-horizon rollouts
-that make rolling out a bottleneck for training. Again, Prime RL is doing very interesting work in this area.
+that make rollout generation a bottleneck for training \cite{primerl2025}.
 
 
 \section{Conclusion}
@@ -401,6 +400,41 @@ This paper was written for the final project of CSE 5820: Reinforcement Learning
 UConn. Thank you to Professor Shi for teaching the class, it was a pleasure learning about this incredibly
 interesting field.
 
-\subsubsection*{References}
+\begin{thebibliography}{99}
+
+\bibitem{espeholt2018impala}
+Lasse Espeholt, Hubert Soyer, Remi Munos, Karen Simonyan, Volodymyr Mnih, Tom Ward,
+Yotam Doron, Vlad Firoiu, Tim Harley, Iain Dunning, Shane Legg, and Koray Kavukcuoglu.
+IMPALA: Scalable Distributed Deep-RL with Importance Weighted Actor-Learner Architectures.
+In \emph{Proceedings of the 35th International Conference on Machine Learning (ICML)}, 2018.
+
+\bibitem{huang2022ppo37}
+Costa Huang, Alejandro Suarez, and others.
+The 37 Implementation Details of Proximal Policy Optimization.
+ICLR Blog Track, 2022. Available at
+\url{https://iclr-blog-track.github.io/2022/03/25/ppo-implementation-details/}.
+
+\bibitem{schulman2017ppo}
+John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov.
+Proximal Policy Optimization Algorithms.
+\emph{arXiv preprint arXiv:1707.06347}, 2017.
+
+\bibitem{schulman2015gae}
+John Schulman, Philipp Moritz, Sergey Levine, Michael Jordan, and Pieter Abbeel.
+High-Dimensional Continuous Control Using Generalized Advantage Estimation.
+\emph{arXiv preprint arXiv:1506.02438}, 2015.
+
+\bibitem{weng2022envpool}
+Jiayi Weng, Min Lin, Shangtong Zhang, Bohang Zhou, Shuicheng Yan, and Weinan Zhang.
+EnvPool: A Highly Parallel Reinforcement Learning Environment Execution Engine.
+\emph{arXiv preprint arXiv:2206.10558}, 2022.
+
+\bibitem{primerl2025}
+Prime Intellect.
+Prime-RL.
+GitHub repository, 2025. Available at
+\url{https://github.com/PrimeIntellect-ai/prime-rl}.
+
+\end{thebibliography}
 
 \end{document}
