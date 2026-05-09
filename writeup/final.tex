@@ -118,7 +118,7 @@ discounted value of the last state. We can also write the $n$-step Bellman targe
 as follows:
 \begin{align*}
     \delta_t &= r_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t) \\
-    v_t &= V_\phi(s_t) + \sum_{t'=t}^{T-1} \gamma^{t'-t} \delta_t
+    v_t &= V_\phi(s_t) + \sum_{t'=t}^{T-1} \gamma^{t'-t} \delta_t'
 \end{align*}
 
 Now we can see that the $n$-step Bellman target is the value of the current state, plus discounted TD-error
@@ -130,11 +130,178 @@ rewards and therefore TD-error correction terms are coming from rollouts that we
 so from a stale policy. This mismatch means that $V_\phi(s_t)$ is supposed to be with respect to the current
 policy, but will be trained to predict the return coming from stale policies.
 
+Since we are sampling from a stale policy, the Bellman target actually estimates $v^\mu_t$, the expected
+cumulative discounted return if we follow a stale policy $\mu$, instead of what we want, which is $v_t$,
+the expected cumulative discounted return if we follow the learner's most updated policy $\pi$.
+\begin{align*}
+v^\mu_t &= \mathbb{E}_{\tau \sim \mu} \left[ V_\phi(s_t) + \sum_{t'=t}^{T-1} \gamma^{t'-t} \delta_t \right] \\
+v_t &= \mathbb{E}_{\tau \sim \pi} \left[ V_\phi(s_t) + \sum_{t'=t}^{T-1} \gamma^{t'-t} \delta_t \right]
+\end{align*}
+
+V-Trace uses importance sampling to correct the TD-error terms.
+\begin{align*}
+v_t &= \mathbb{E}_{\tau \sim \mu} \left[ V_\phi(s_t) + \sum_{t'=t}^{T-1} \gamma^{t'-t}
+\left( \prod_{i=t}^{t'} \rho_i \right)
+\delta_t \right] \\
+\rho_t &= \frac{\pi(a_t|s_t)}{\mu(a_t|s_t)}
+\end{align*}
+
+Since the importance sampling weight $\rho_t = \frac{\pi(a_t|s_t)}{\mu(a_t|s_t)}$ can blow up when
+$\mu(a_t|s_t) \ll \pi(a_t|s_t)$ and cause $v_t$ to be a very high variance approximation, the authors use
+truncated importance sampling weights. The authors also split importance weights into the weight for the
+latest TD-error, $\rho_t$ and the weight for all previous TD-errors, $c_t$ to give an extra degree of
+freedom for reward shaping. Note that despite this, the authors of IMPALA use $\rho_{\max} = c_{\max}$, so
+the split does not matter in practice.
+\begin{align*}
+v_t &= V_\phi(s_t) + \sum_{t'=t}^{T-1} \gamma^{t'-t}
+\left( \prod_{i=t}^{t'-1} \hat{c}_i \right)
+\hat{\rho}_{t'} \delta_t \\
+\hat{\rho}_t &= \min(\rho_t, \rho_{\max}) \qquad \hat{c}_t = \min(\rho_t, c_{\max})
+\end{align*}
+
+We can now see why IMPALA sends rollouts from actors to the learner instead of gradients like A3C.
+Importance sampling requires both the log probabilities of the stale actor and the current learner. In
+A3C like asynchronous architectures, each actors does an optimization step independently, so it never
+has the log probabilities of the current learner.
 
 
+\section{Methodology}
+For all experiments, we use the Pong-v5 environment from EnvPool for gymansium-compatible parallel
+environments. We use EnvPool's default Atari wrapper parameters, including 4 frame stack, grayscale, 4 frame
+skip, and random noops at the start of each episode for stochasticity.
+
+We use a convolutional actor-critic network as the agent. The agent has a shared feature extractor backbone
+and actor and critic heads. The design of the agent is heavily inspired by The 37 Implementation Details of
+Proximal Policy Optimization by Costa Huang Et. al
+(\url{https://iclr-blog-track.github.io/2022/03/25/ppo-implementation-details/}).
+
+As a synchronous baseline, we use a single learner process with vectorized environments. In addition to the
+usual suspects of learning rate and Adam $\beta_1, \beta_2$, we tune the number of parallel environments,
+rollout steps, and optimization steps to minimize the amount of time until the agent reaches maximal reward
+on Pong.
+
+We also train a local asynchronous baseline using multiprocessing actors that write rollouts to a shared queue.
+The learner process pops rollouts, does optimization steps, and writes the latest weights to a queue for each
+actor to get.
+
+For our distributed asynchronous architecture, we use multiple actor processes that communicate
+via TCP over Tailscale to a single learner process. Each actor requests updated weights from the learner,
+collects multiple rollouts in parallel environments, and sends the rollouts to the learner. On the learner
+side, there is the main optimization thread which gets rollouts from a shared queue, and a connection handler
+thread that constantly listens for TCP connections for actors. For each actor, the connection handler spawns
+an actor handling thread that responds to weight requests and collects rollouts in the rollout queue.
+
+Every TCP message in our protocol starts with a header made up of protocol magic bytes
+the message type, a \verb|GET_WEIGHTS| request from the actor, \verb|WEIGHTS| broadcast from the learner,
+a \verb|ROLLOUT| batch from the actor, or an \verb|ACK|. \verb|ACK| messages just have the protocol header.
+
+\verb|GET_WEIGHTS| requests consist of just the header and the version number of the actor's policy. The learner
+updates a policy version count that increments every time an optimization step is done. That way,
+if the actor's policy is not too stale (set by a configurable maximum allowed staleness) and the learner receives
+a \verb|GET_WEIGHTS| request from the actor, the learner will just send an empty \verb|WEIGHTS| message back
+that tells the actor to continue, and we don't have to send the network weights to the actor.
+
+\verb|WEIGHTS| messages contain the learner's policy version as well as all of the agent's weights. Since we use
+\verb|pytorch| in this project, the actor weights are completely defined by the state dict, which maps a name to
+each weight tensor. To serialize each tensor, we store the name of the parameter's \verb|dtype|, the number of
+dimensions, the shape, and the flattened raw bytes of the tensor. To deserialize the agent's state dict, the actor
+reads the weight's name and reshapes the tensor's raw bytes.
+
+\verb|ROLLOUT| messages contain the actor's uuid to identify which actors are contributing the most rollouts,
+local policy version, and the rollout, which consists of observations, actions, rewards, actor policy log
+probabilities, and a done mask. The actor's local policy version is used by the learner to throw away any
+rollouts that are too stale, set again by a configurable threshold. This prevents extremely old rollout batches
+from causing training destabilizaiton.
+
+Naively sending \verb|ROLLOUT| and \verb|WEIGHTS| messages would cause the protocol to be very inefficient and mostly
+network bandwidth bottlenecked. With our settings, a rollout of 32 timesteps, 16 parallel environments per actor,
+4 frames stacked per observation, and 84x84 grayscale frames would send 14.45 MB of rollouts across the internet
+for every actor. Our protocol introduced two optimizations for this problem, frame stack deduplication and lossless
+rollout compression. Since each observation stacks the last 3 frames and the newest frame together, every
+additional observation really only has 1 frame of new information. So then instead of sending all 4 frames every observation,
+we can just send the all 4 frames of the first observation and whenever the environment resets, and the last frame for every
+additional observation. Then, on the learner's side, the learner will use the reset mask to restack all frames. Using frame
+deduplication, we lower the memory usage of a rollout to around 3.95 MB, a 3.7x reducction in memory usage. Furthermore,
+there is reason to suspect that the observation frames are highly compressible. In Pong, most pixels do not move, so most frames
+are identical to previous frames, give or take a couple pixels where the paddle or the ball has moved. This means that even the
+deduplicated frames likely have a lot of redundancy, which we take advantage of by running \verb|lz4| compression on, reducing the
+memory usage to 90 KB at a 43.9x compression rate. After all of our optimizations, we get around 160.6x rollous compression,
+using only around 176 bytes per observation. We also use compression on model weights, and reduce the parameter size from 1.8 MB
+to 1.3 MB. We use a \verb|COMPRESSED| flag in the protocol so that we have the option to leave a message uncompressed if
+trying to compress it would not reduce the message size by enough to justify the extra decompression time.
+
+The main difference between our protocol and the existing IMPALA protocol is that ours is built for heterogeneous compute pooling.
+Whereas the IMPALA protocol is meant for large scale training runs in a datacenter with actors all running on similar,
+stable hardware, our protocol explicitly addresses the issues of fault tolerance and extreme rollout staleness. Since our
+protocol is meant to allow researchers to share idle compute, we need to make our protocol resilient to actors leaving and joining
+the training run at any time. We handle this by having the learner's connection manager spawn a new handler thread for every actor
+that joins the training run. When actors leave the network, the learner's corresponding handler thread exits, and everything
+gracefully continues from the perspective of the learner's main optimization thread. When the device rejoins the network, the learner
+simply considers the device as a new actor and adds a handler. The separation of responsibilities between the optimization thread
+and the actor handlers on the learner allows us to have this clean fault-tolerant API that connects the optimization and actor
+handlers soley by the rollouts in the queue and the most updated learner agent weights. To handle extremely stale
+rollouts, which can occur if some actors are very slow or the TCP message gets delayed in transit, we also introduce a configurable
+maximum policy lag hyperparameter that the learner uses to throw away potentially destabilizing rollouts. Furthermore, another
+potential problem when doing this kind of asynchronous communication is that if the learner somehow takes too long to do an update,
+either because of a problem on the learner device or just if there are too many actors, actors can end up filling the learner's
+rollout queue completely. This is a problem because then by the time the learner performs optimization steps on each rollout, the
+rollouts in the back of the queue put there long ago by the overhang of actors will already be stale, and they will go to waste,
+along with the compute on the actors side it took to collect those rollouts and the compute the learner used decompressing, deserializing,
+and preparing the rollout for optimization. To alleviate this problem, learners send \verb|ACK| messages in response to collecting
+rollouts from actors. Actors can only continue sampling rollouts after a learner ACKs their last rollout, which provides some
+backpressure for actors to not compeltely saturate the learner's queue.
+
+
+\section{Results}
+We heavily tuned our synchronous and local asynchronous baselines to provide a fair comparison to our distributed, asynchronous
+protocol. For our synchronous baseline, we ran hyperparamter sweeps on learning rate, Adam $\beta_1$ $\beta_2$, update steps per
+rollout, number of parallel environments, and rollout length, searching for the configuration that would minimize time for the agent
+to reach maximum (21) reward on Pong. We chose the metric of time to maximum reward on Pong because Pong is a relatively simple
+environment that we can iterate quickly on, and achieving a faster time to essentially solve Pong would demonstrate the speed and
+power of our protocol. For our local asynchronous baseline, in addition to the hyperparameters we tuned for the synchronous baseline,
+we also tuned the number of actor processes, as well as the max policy lag before the learner throws out a rollout.
+Our synchronous baseline beat the local asynchronous baseline with 2 actors. We hypothesize that the reason for this is that
+the local asynchronous baseline simply introduces too much overhead compared to the synchronous baseline and ran much slower.
+The machine we used for experiments was simply not powerful enough to handle the 2 actors while running the optimal number of
+environments in parallel. We tried decreasing the number of parallel environments running in each actor, but then the learner would
+have to wait for 2 rollout batches for the optimal rollout batch size, which negated any gains we got from rolling out in parallel.
+So for the local asynchronous baseline, we truly were compute constrained, which is exactly the situation this paper tries to address.
+If we could run more actors in parallel, increasing the rollout throughput, then we would be able to beat the syncrhonous baseline.
+
+For our distributed asynchronous protocol, we ran the learner and a single actor on a desktop connected it to 2 actors on a laptop
+via Tailscale. Compare this to the asynchronous baseline, where we were trying to run a learner and 2 actors on the same desktop.
+Using the distributed asynchronous protol, we were able to beat our heavily tuned synchronous baseline, reaching maximum reward on Pong
+in 3.3 minutes, compared to the synchronous baseline, which took 5.1 minutes (Fig 1). So our distributed protocol was able to beat the
+synchronous basline in terms of wall clock time. These gains came exclusively from higher rollout and update throughput. Comparing the
+the synchronous and distributed rewards by environment steps, both runs reach maximum Pong reward at around 2M environment steps (Fig 2).
+This makes a lot of sense, as the gains from distributed training do not come from increased sample efficiency. In fact, one would even
+suspsect that distributed training would be worse for sample efficiency because of the stale policy problem. Instead, the gains from
+distributed training, the 1.5x speed increase using our distributed training setup comes just from increased rollout and update
+throughput, overlapping rollouts on actor devices with optimization steps on the learner device and eliminating any idle waiting time
+between the two phases.
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=\textwidth]{final_imgs/dist_sync_rel.png}
+    \caption{Wall-clock comparison of distributed protocol (blue) vs synchronous baseline (red).}
+    \label{fig:dist_sync_rel}
+\end{figure}
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=\textwidth]{final_imgs/dist_sync_step.png}
+    \caption{Env step comparison of distributed protocol (blue) vs synchronous baseline (red).}
+    \label{fig:dist_sync_step}
+\end{figure}
+
+
+
+\section{Limitations and Future Work}
+
+\section{Conclusion}
 
 
 
 % \subsubsection*{Acknowledgments}
 % \subsubsection*{References}
-\end{document}$
+\end{document}
